@@ -750,6 +750,10 @@ static void generate_modulated_rf_packet(uint8_t mode,
 	/* One byte used for size, actual size is SIZE-1 */
 #if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
 	if (mode == NRF_RADIO_MODE_IEEE802154_250KBIT) {
+		/* Keep full IEEE payload size by default, but we will insert
+		 * a signature at the start of the payload so receiver can
+		 * validate packets.
+		 */
 		tx_packet[0] = IEEE_MAX_PAYLOAD_LEN - 1;
 	} else {
 		tx_packet[0] = sizeof(tx_packet) - 1;
@@ -772,6 +776,26 @@ static void generate_modulated_rf_packet(uint8_t mode,
 		/* Do nothing. */
 		break;
 	}
+
+	#if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
+		/* Signature placed at start of payload (after length byte).
+		 * Receiver will look for this signature to count the packet as valid.
+		 */
+		{
+			const uint8_t ieee_sig[] = { 0xDE, 0xAD, 0xBE, 0xEF };
+			const size_t sig_len = sizeof(ieee_sig);
+
+			if (mode == NRF_RADIO_MODE_IEEE802154_250KBIT) {
+				/* Ensure we don't overflow payload. tx_packet[0] is payload length
+				 * (excluding the length byte), so cap the signature placement.
+				 */
+				size_t payload_space = tx_packet[0];
+				if (payload_space >= sig_len) {
+					memcpy(tx_packet + 1, ieee_sig, sig_len);
+				}
+			}
+		}
+	#endif /* CONFIG_HAS_HW_NRF_RADIO_IEEE802154 */
 
 	nrf_radio_packetptr_set(NRF_RADIO, tx_packet);
 }
@@ -1266,7 +1290,29 @@ void radio_handler(const void *context)
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK) &&
 	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_CRCOK)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_CRCOK);
+		/* For IEEE 802.15.4 250Kbit mode, verify a small signature at the
+		 * start of the payload (after the length byte) before counting the
+		 * packet as valid. For other modes, count on CRCOK as before.
+		 */
+#if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
+		if (nrf_radio_mode_get(NRF_RADIO) == NRF_RADIO_MODE_IEEE802154_250KBIT) {
+			const uint8_t ieee_sig[] = { 0xDE, 0xAD, 0xBE, 0xEF };
+			const size_t sig_len = sizeof(ieee_sig);
+			uint8_t payload_len = rx_packet[0];
+
+			if ((size_t)payload_len >= sig_len &&
+				memcmp(rx_packet + 1, ieee_sig, sig_len) == 0) {
+				rx_packet_cnt++;
+			} else {
+				/* Signature mismatch — ignore this packet for counting. */
+			}
+		} else {
+			rx_packet_cnt++;
+		}
+#else
 		rx_packet_cnt++;
+#endif /* CONFIG_HAS_HW_NRF_RADIO_IEEE802154 */
+
 		if (config->params.rx.packets_num) {
 			if (rx_packet_cnt == config->params.rx.packets_num) {
 				k_work_reschedule(&rx_timeout_work, K_NO_WAIT);
