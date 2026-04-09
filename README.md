@@ -1,5 +1,4 @@
 Site Survey
-###########
 
 This firmware is designed for the XIAO nRF54L15.
 It is built off of Nordics radio_test sample. A link below provides more information about the radio_test sample and how to use it.
