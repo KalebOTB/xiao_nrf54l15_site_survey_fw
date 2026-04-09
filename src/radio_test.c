@@ -627,9 +627,20 @@ static void radio_config(nrf_radio_mode_t mode, enum transmit_pattern pattern)
 		packet_conf.big_endian = false;
 		packet_conf.whiteen = false;
 
+		/* Set CRC length for IEEE 802.15.4 (2 bytes FCS) so CRCOK is reported */
+#if defined(RADIO_CRCCNF_LEN_Two)
+		//nrf_radio_crc_configure(NRF_RADIO, RADIO_CRCCNF_LEN_Two,
+		//			NRF_RADIO_CRC_ADDR_INCLUDE, 0);
+		nrf_radio_crc_configure(NRF_RADIO,
+			RADIO_CRCCNF_LEN_Two,
+			NRF_RADIO_CRC_ADDR_SKIP,
+			0x1021);
+
 		/* preamble, address (BALEN + PREFIX), lflen and payload */
 		total_payload_size = 4 + (packet_conf.balen + 1) + 1 + packet_conf.maxlen;
 		break;
+#endif /* defined(RADIO_CRCCNF_LEN_Two) */
+
 #endif /* CONFIG_HAS_HW_NRF_RADIO_IEEE802154 */
 
 #if CONFIG_HAS_HW_NRF_RADIO_BLE_CODED
@@ -962,7 +973,12 @@ static void radio_rx(uint8_t mode, uint8_t channel, enum transmit_pattern patter
 
 	rx_packet_cnt = 0;
 
-	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK);
+	/* Enable CRCOK and END interrupts so we can detect frames that finish
+	 * but fail CRC (END without CRCOK). This helps with diagnosing why
+	 * no CRCOK events are observed.
+	 */
+	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK);// | RADIO_TEST_INT_END_MASK);
+
 
 #if CONFIG_FEM
 	(void)fem_configure(true, mode, &fem);
@@ -1324,16 +1340,38 @@ void radio_handler(const void *context)
 
 #if defined(RADIO_INTENSET_PHYEND_Msk) || defined(RADIO_INTENSET00_PHYEND_Msk)
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_PHYEND_MASK) &&
-	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_PHYEND)) {
+		nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_PHYEND)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_PHYEND);
-		on_radio_end(config);
+		/* Only treat PHYEND as a TX "end" for modulated TX test. */
+		if (config->type == MODULATED_TX) {
+			on_radio_end(config);
+		}
 	}
 #endif /* defined(RADIO_INTENSET_PHYEND_Msk) || defined(RADIO_INTENSET00_PHYEND_Msk) */
 
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_END_MASK) &&
-	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_END)) {
+		nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_END)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_END);
-		on_radio_end(config);
+
+		/* If this is a RX test and CRCOK did not fire, dump the received
+		 * buffer so we can see what arrived on-air. Do not call
+		 * on_radio_end() for RX since that function is for TX handling.
+		 */
+		if (config->type == RX) {
+			/* Print a short diagnostic when an END occurs without CRCOK. */
+			printk("radio_handler: END event (RX) — CRCOK not set, dumping first bytes:\n");
+			uint8_t payload_len = rx_packet[0];
+			unsigned int dump_len = (unsigned int)(payload_len + 1);
+			if (dump_len > 16) {
+				dump_len = 16;
+			}
+			for (unsigned int i = 0; i < dump_len; i++) {
+				printk("%02X ", rx_packet[i]);
+			}
+			printk("\n");
+		} else if (config->type == MODULATED_TX) {
+			on_radio_end(config);
+		}
 	}
 }
 
