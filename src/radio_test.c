@@ -20,6 +20,7 @@
 #include <nrfx_timer.h>
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
+#include <zephyr/sys/util.h>
 
 #include <hal/nrf_egu.h>
 #include <helpers/nrfx_gppi.h>
@@ -119,6 +120,48 @@ static void (**rx_timeout_cb)(void);
 
 static volatile bool cancel_request;
 static volatile bool test_is_running;
+
+#define RADIO_PROTO_MAGIC0             0xA5
+#define RADIO_PROTO_MAGIC1             0x5A
+#define RADIO_PROTO_VERSION            1
+#define RADIO_PROTO_BROADCAST_SIG      0xFFFFFFFFu
+#define RADIO_PROTO_HEADER_SIZE        15
+
+struct radio_proto_frame {
+	uint8_t cmd;
+	uint8_t flags;
+	uint32_t src_signature;
+	uint32_t dst_signature;
+	uint16_t value;
+};
+
+static enum radio_proto_role proto_role = RADIO_PROTO_ROLE_DISABLED;
+static uint32_t proto_local_signature;
+static uint8_t proto_seq;
+static uint32_t proto_discover_req_seen;
+static uint32_t proto_discover_rsp_seen;
+static uint32_t proto_test_data_seen;
+static uint32_t proto_per_req_seen;
+static uint32_t proto_per_rsp_seen;
+static uint32_t proto_local_test_data_rx;
+static struct radio_proto_peer proto_peers[RADIO_PROTO_MAX_PEERS];
+static uint8_t proto_peer_count;
+
+static bool proto_tx_override_valid;
+static uint8_t proto_tx_override_payload[IEEE_MAX_PAYLOAD_LEN];
+static uint8_t proto_tx_override_len;
+
+static bool proto_rsp_pending;
+static enum radio_proto_cmd proto_rsp_cmd;
+static uint32_t proto_rsp_dst_sig;
+static uint16_t proto_rsp_value;
+
+static bool proto_resume_rx_after_rsp;
+static uint8_t proto_rx_channel;
+static enum transmit_pattern proto_rx_pattern;
+
+static void proto_rsp_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(proto_rsp_work, proto_rsp_work_handler);
 
 #if NRF54H_ERRATA_216_PRESENT
 static const struct mbox_dt_spec on_channel =
@@ -555,6 +598,118 @@ static void radio_channel_set(nrf_radio_mode_t mode, uint8_t channel)
 	nrf_radio_frequency_set(NRF_RADIO, frequency);
 }
 
+static uint32_t proto_u32_get_le(const uint8_t *buf)
+{
+	return ((uint32_t)buf[0]) |
+		(((uint32_t)buf[1]) << 8) |
+		(((uint32_t)buf[2]) << 16) |
+		(((uint32_t)buf[3]) << 24);
+}
+
+static void proto_u32_put_le(uint8_t *buf, uint32_t value)
+{
+	buf[0] = (uint8_t)(value & 0xFFu);
+	buf[1] = (uint8_t)((value >> 8) & 0xFFu);
+	buf[2] = (uint8_t)((value >> 16) & 0xFFu);
+	buf[3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
+static uint16_t proto_u16_get_le(const uint8_t *buf)
+{
+	return (uint16_t)(((uint16_t)buf[0]) | (((uint16_t)buf[1]) << 8));
+}
+
+static void proto_u16_put_le(uint8_t *buf, uint16_t value)
+{
+	buf[0] = (uint8_t)(value & 0xFFu);
+	buf[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+static struct radio_proto_peer *proto_find_or_add_peer(uint32_t signature)
+{
+	for (uint8_t i = 0; i < proto_peer_count; i++) {
+		if (proto_peers[i].signature == signature) {
+			return &proto_peers[i];
+		}
+	}
+
+	if (proto_peer_count >= ARRAY_SIZE(proto_peers)) {
+		return NULL;
+	}
+
+	struct radio_proto_peer *peer = &proto_peers[proto_peer_count++];
+
+	memset(peer, 0, sizeof(*peer));
+	peer->signature = signature;
+
+	return peer;
+}
+
+static bool proto_frame_decode(const uint8_t *payload, uint8_t payload_len,
+			       struct radio_proto_frame *frame)
+{
+	if (payload_len < RADIO_PROTO_HEADER_SIZE) {
+		return false;
+	}
+
+	if (payload[0] != RADIO_PROTO_MAGIC0 ||
+	    payload[1] != RADIO_PROTO_MAGIC1 ||
+	    payload[2] != RADIO_PROTO_VERSION) {
+		return false;
+	}
+
+	frame->cmd = payload[3];
+	frame->flags = payload[4];
+	frame->src_signature = proto_u32_get_le(&payload[5]);
+	frame->dst_signature = proto_u32_get_le(&payload[9]);
+	frame->value = proto_u16_get_le(&payload[13]);
+
+	return true;
+}
+
+static uint8_t proto_frame_encode(uint8_t *payload, size_t payload_capacity,
+			      enum radio_proto_cmd cmd,
+			      uint32_t src_signature,
+			      uint32_t dst_signature,
+			      uint16_t value)
+{
+	if (payload_capacity < 15) {
+		return 0;
+	}
+
+	payload[0] = RADIO_PROTO_MAGIC0;
+	payload[1] = RADIO_PROTO_MAGIC1;
+	payload[2] = RADIO_PROTO_VERSION;
+	payload[3] = (uint8_t)cmd;
+	payload[4] = proto_seq++;
+	proto_u32_put_le(&payload[5], src_signature);
+	proto_u32_put_le(&payload[9], dst_signature);
+	proto_u16_put_le(&payload[13], value);
+
+	return 15;
+}
+
+static bool proto_frame_for_me(uint32_t dst_signature)
+{
+	return (dst_signature == RADIO_PROTO_BROADCAST_SIG) ||
+	       (dst_signature == proto_local_signature);
+}
+
+static void proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
+{
+	if (proto_role != RADIO_PROTO_ROLE_RX) {
+		return;
+	}
+
+	proto_rsp_cmd = cmd;
+	proto_rsp_dst_sig = dst_signature;
+	proto_rsp_value = value;
+	proto_rsp_pending = true;
+
+	/* Spread responder transmissions and leave time for TX node to switch to RX. */
+	k_work_reschedule(&proto_rsp_work, K_MSEC((sys_rand32_get() % 25u) + 15u));
+}
+
 static void radio_config(nrf_radio_mode_t mode, enum transmit_pattern pattern)
 {
 	nrf_radio_packet_conf_t packet_conf;
@@ -761,10 +916,14 @@ static void generate_modulated_rf_packet(uint8_t mode,
 	/* One byte used for size, actual size is SIZE-1 */
 #if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
 	if (mode == NRF_RADIO_MODE_IEEE802154_250KBIT) {
-		/* Keep full IEEE payload size by default, but we will insert
-		 * a signature at the start of the payload so receiver can
-		 * validate packets.
-		 */
+		if (proto_tx_override_valid) {
+			tx_packet[0] = proto_tx_override_len;
+			memcpy(tx_packet + 1, proto_tx_override_payload, proto_tx_override_len);
+			proto_tx_override_valid = false;
+			nrf_radio_packetptr_set(NRF_RADIO, tx_packet);
+			return;
+		}
+
 		tx_packet[0] = IEEE_MAX_PAYLOAD_LEN - 1;
 	} else {
 		tx_packet[0] = sizeof(tx_packet) - 1;
@@ -787,26 +946,6 @@ static void generate_modulated_rf_packet(uint8_t mode,
 		/* Do nothing. */
 		break;
 	}
-
-	#if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
-		/* Signature placed at start of payload (after length byte).
-		 * Receiver will look for this signature to count the packet as valid.
-		 */
-		{
-			const uint8_t ieee_sig[] = { 0xDE, 0xAD, 0xBE, 0xEF };
-			const size_t sig_len = sizeof(ieee_sig);
-
-			if (mode == NRF_RADIO_MODE_IEEE802154_250KBIT) {
-				/* Ensure we don't overflow payload. tx_packet[0] is payload length
-				 * (excluding the length byte), so cap the signature placement.
-				 */
-				size_t payload_space = tx_packet[0];
-				if (payload_space >= sig_len) {
-					memcpy(tx_packet + 1, ieee_sig, sig_len);
-				}
-			}
-		}
-	#endif /* CONFIG_HAS_HW_NRF_RADIO_IEEE802154 */
 
 	nrf_radio_packetptr_set(NRF_RADIO, tx_packet);
 }
@@ -970,6 +1109,8 @@ static void radio_rx(uint8_t mode, uint8_t channel, enum transmit_pattern patter
 
 	radio_config(mode, pattern);
 	radio_channel_set(mode, channel);
+	proto_rx_channel = channel;
+	proto_rx_pattern = pattern;
 
 	rx_packet_cnt = 0;
 
@@ -1306,21 +1447,73 @@ void radio_handler(const void *context)
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK) &&
 	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_CRCOK)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_CRCOK);
-		/* For IEEE 802.15.4 250Kbit mode, verify a small signature at the
-		 * start of the payload (after the length byte) before counting the
-		 * packet as valid. For other modes, count on CRCOK as before.
-		 */
+
 #if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
 		if (nrf_radio_mode_get(NRF_RADIO) == NRF_RADIO_MODE_IEEE802154_250KBIT) {
-			const uint8_t ieee_sig[] = { 0xDE, 0xAD, 0xBE, 0xEF };
-			const size_t sig_len = sizeof(ieee_sig);
 			uint8_t payload_len = rx_packet[0];
+			struct radio_proto_frame frame;
+			bool frame_ok = proto_frame_decode(rx_packet + 1, payload_len, &frame);
 
-			if ((size_t)payload_len >= sig_len &&
-				memcmp(rx_packet + 1, ieee_sig, sig_len) == 0) {
+			if (proto_role == RADIO_PROTO_ROLE_DISABLED) {
 				rx_packet_cnt++;
-			} else {
-				/* Signature mismatch — ignore this packet for counting. */
+			} else if (frame_ok) {
+				rx_packet_cnt++;
+
+				switch (frame.cmd) {
+				case RADIO_PROTO_CMD_DISCOVER_REQ:
+					proto_discover_req_seen++;
+					if (proto_role == RADIO_PROTO_ROLE_RX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						proto_schedule_response(RADIO_PROTO_CMD_DISCOVER_RSP,
+								      frame.src_signature,
+								      0);
+					}
+					break;
+				case RADIO_PROTO_CMD_DISCOVER_RSP:
+					proto_discover_rsp_seen++;
+					if (proto_role == RADIO_PROTO_ROLE_TX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						struct radio_proto_peer *peer =
+							proto_find_or_add_peer(frame.src_signature);
+
+						if (peer != NULL) {
+							peer->seen_discover_rsp = true;
+						}
+					}
+					break;
+				case RADIO_PROTO_CMD_TEST_DATA:
+					proto_test_data_seen++;
+					if (proto_role == RADIO_PROTO_ROLE_RX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						proto_local_test_data_rx++;
+					}
+					break;
+				case RADIO_PROTO_CMD_PER_REQ:
+					proto_per_req_seen++;
+					if (proto_role == RADIO_PROTO_ROLE_RX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						proto_schedule_response(RADIO_PROTO_CMD_PER_RSP,
+								      frame.src_signature,
+								      (uint16_t)MIN(proto_local_test_data_rx,
+										  UINT16_MAX));
+					}
+					break;
+				case RADIO_PROTO_CMD_PER_RSP:
+					proto_per_rsp_seen++;
+					if (proto_role == RADIO_PROTO_ROLE_TX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						struct radio_proto_peer *peer =
+							proto_find_or_add_peer(frame.src_signature);
+
+						if (peer != NULL) {
+							peer->seen_per_rsp = true;
+							peer->reported_rx_packets = frame.value;
+						}
+					}
+					break;
+				default:
+					break;
+				}
 			}
 		} else {
 			rx_packet_cnt++;
@@ -1342,8 +1535,13 @@ void radio_handler(const void *context)
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_PHYEND_MASK) &&
 		nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_PHYEND)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_PHYEND);
-		/* Only treat PHYEND as a TX "end" for modulated TX test. */
-		if (config->type == MODULATED_TX) {
+		if (proto_resume_rx_after_rsp) {
+			proto_resume_rx_after_rsp = false;
+			radio_rx(NRF_RADIO_MODE_IEEE802154_250KBIT,
+				 proto_rx_channel,
+				 proto_rx_pattern,
+				 0);
+		} else if (config->type == MODULATED_TX) {
 			on_radio_end(config);
 		}
 	}
@@ -1375,6 +1573,115 @@ void radio_handler(const void *context)
 	}
 }
 
+static void proto_rsp_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!proto_rsp_pending || proto_role != RADIO_PROTO_ROLE_RX) {
+		return;
+	}
+
+	if (radio_proto_prepare_tx(proto_rsp_cmd, proto_rsp_dst_sig, proto_rsp_value) != 0) {
+		return;
+	}
+
+	proto_rsp_pending = false;
+	proto_resume_rx_after_rsp = true;
+
+	radio_disable();
+	radio_modulated_tx_carrier(NRF_RADIO_MODE_IEEE802154_250KBIT,
+				   0,
+				   proto_rx_channel,
+				   TRANSMIT_PATTERN_RANDOM,
+				   1);
+}
+
+void radio_proto_set_signature(uint32_t signature)
+{
+	proto_local_signature = signature;
+}
+
+void radio_proto_set_role(enum radio_proto_role role)
+{
+	proto_role = role;
+}
+
+enum radio_proto_role radio_proto_get_role(void)
+{
+	return proto_role;
+}
+
+void radio_proto_reset(void)
+{
+	proto_discover_req_seen = 0;
+	proto_discover_rsp_seen = 0;
+	proto_test_data_seen = 0;
+	proto_per_req_seen = 0;
+	proto_per_rsp_seen = 0;
+	proto_local_test_data_rx = 0;
+	proto_peer_count = 0;
+	proto_rsp_pending = false;
+	proto_resume_rx_after_rsp = false;
+	k_work_cancel_delayable(&proto_rsp_work);
+	memset(proto_peers, 0, sizeof(proto_peers));
+}
+
+int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
+{
+	uint8_t len;
+
+	if (proto_local_signature == 0u) {
+		return -EINVAL;
+	}
+
+	len = proto_frame_encode(proto_tx_override_payload,
+				 sizeof(proto_tx_override_payload),
+				 cmd,
+				 proto_local_signature,
+				 dst_signature,
+				 value);
+	if (len == 0) {
+		return -EINVAL;
+	}
+
+	proto_tx_override_len = len;
+	proto_tx_override_valid = true;
+
+	return 0;
+}
+
+void radio_proto_get_status(struct radio_proto_status *status)
+{
+	if (status == NULL) {
+		return;
+	}
+
+	memset(status, 0, sizeof(*status));
+	status->role = proto_role;
+	status->local_signature = proto_local_signature;
+	status->discover_req_seen = proto_discover_req_seen;
+	status->discover_rsp_seen = proto_discover_rsp_seen;
+	status->test_data_seen = proto_test_data_seen;
+	status->per_req_seen = proto_per_req_seen;
+	status->per_rsp_seen = proto_per_rsp_seen;
+	status->local_test_data_rx = proto_local_test_data_rx;
+	status->peer_count = proto_peer_count;
+	for (uint8_t i = 0; i < proto_peer_count; i++) {
+		status->peers[i] = proto_peers[i];
+	}
+}
+
+uint8_t radio_proto_get_peer_signatures(uint32_t *signatures, uint8_t max_count)
+{
+	uint8_t count = MIN(max_count, proto_peer_count);
+
+	for (uint8_t i = 0; i < count; i++) {
+		signatures[i] = proto_peers[i].signature;
+	}
+
+	return count;
+}
+
 int radio_test_init(struct radio_test_config *config)
 {
 	int nrfx_err;
@@ -1394,6 +1701,11 @@ int radio_test_init(struct radio_test_config *config)
 	}
 
 	rx_timeout_cb = &config->params.rx.cb;
+
+	if (proto_local_signature == 0u) {
+		proto_local_signature = sys_rand32_get();
+	}
+	radio_proto_reset();
 
 #if CONFIG_FEM
 	int err = fem_init(timer.p_reg,

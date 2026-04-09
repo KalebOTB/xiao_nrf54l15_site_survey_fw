@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <zephyr/init.h>
+#include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/types.h>
 #if !defined(CONFIG_SOC_SERIES_NRF54HX)
@@ -93,6 +94,24 @@ static struct radio_param_config default_config = {
 
 /* Radio test configuration. */
 static struct radio_test_config test_config;
+
+struct radio_proto_cli_config {
+	uint32_t signature;
+	enum radio_proto_role role;
+	uint32_t discover_window_ms;
+	uint32_t per_wait_ms;
+	uint32_t test_packets;
+};
+
+static struct radio_proto_cli_config proto_cfg = {
+	.signature = 0,
+	.role = RADIO_PROTO_ROLE_DISABLED,
+	.discover_window_ms = 250,
+	.per_wait_ms = 80,
+	.test_packets = 100,
+};
+
+static K_SEM_DEFINE(proto_tx_done_sem, 0, 1);
 
 /* If true, RX sweep, TX sweep or duty cycle test is performed. */
 static bool test_in_progress;
@@ -1173,6 +1192,396 @@ static int cmd_print_payload(const struct shell *shell, size_t argc,
 	return 0;
 }
 
+static void proto_single_tx_done(void)
+{
+	k_sem_give(&proto_tx_done_sem);
+}
+
+static bool proto_require_ieee_mode(const struct shell *shell)
+{
+	if (config.mode != NRF_RADIO_MODE_IEEE802154_250KBIT) {
+		shell_error(shell, "Set data_rate ieee802154_250Kbit first");
+		return false;
+	}
+
+	return true;
+}
+
+static int proto_send_frame(const struct shell *shell, enum radio_proto_cmd cmd,
+			    uint32_t dst_signature, uint16_t value,
+			    uint32_t packets_num)
+{
+	int err;
+	int sem_err;
+	uint32_t timeout_ms;
+
+	if (!proto_require_ieee_mode(shell)) {
+		return -EINVAL;
+	}
+
+	if (packets_num == 0) {
+		shell_error(shell, "packets_num must be greater than zero");
+		return -EINVAL;
+	}
+
+	err = radio_proto_prepare_tx(cmd, dst_signature, value);
+	if (err) {
+		shell_error(shell, "Failed to prepare protocol frame (%d)", err);
+		return err;
+	}
+
+	memset(&test_config, 0, sizeof(test_config));
+	test_config.type = MODULATED_TX;
+	test_config.mode = config.mode;
+	test_config.params.modulated_tx.txpower = config.txpower;
+	test_config.params.modulated_tx.channel = config.channel_start;
+	test_config.params.modulated_tx.pattern = TRANSMIT_PATTERN_RANDOM;
+	test_config.params.modulated_tx.packets_num = packets_num;
+	test_config.params.modulated_tx.cb = proto_single_tx_done;
+#if CONFIG_FEM
+	test_config.fem = config.fem;
+#endif /* CONFIG_FEM */
+
+	/* Drain stale completion signals before starting a new TX command. */
+	while (k_sem_take(&proto_tx_done_sem, K_NO_WAIT) == 0) {
+		/* Do nothing */
+	}
+
+	radio_test_start(&test_config);
+
+	/* Conservative timeout so TX flow does not preempt an active burst. */
+	timeout_ms = MAX(1000u, packets_num * 4u + 300u);
+	sem_err = k_sem_take(&proto_tx_done_sem, K_MSEC(timeout_ms));
+	if (sem_err != 0) {
+		shell_error(shell,
+			"Timed out waiting for TX completion (cmd=%u packets=%u timeout_ms=%u)",
+			(unsigned int)cmd,
+			(unsigned int)packets_num,
+			(unsigned int)timeout_ms);
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+static void proto_start_rx_continuous(void)
+{
+	memset(&test_config, 0, sizeof(test_config));
+	test_config.type = RX;
+	test_config.mode = config.mode;
+	test_config.params.rx.channel = config.channel_start;
+	test_config.params.rx.pattern = TRANSMIT_PATTERN_RANDOM;
+	test_config.params.rx.packets_num = 0;
+#if CONFIG_FEM
+	test_config.fem = config.fem;
+#endif /* CONFIG_FEM */
+
+	radio_test_start(&test_config);
+}
+
+static void proto_rx_window(uint32_t window_ms)
+{
+	proto_start_rx_continuous();
+	k_msleep(window_ms);
+	radio_test_cancel(test_config.type);
+	k_msleep(5);
+}
+
+static int cmd_proto_signature_set(const struct shell *shell, size_t argc, char **argv)
+{
+	unsigned long sig;
+
+	if (argc != 2) {
+		shell_error(shell, "Usage: proto_signature <u32>");
+		return -EINVAL;
+	}
+
+	sig = strtoul(argv[1], NULL, 0);
+	proto_cfg.signature = (uint32_t)sig;
+	radio_proto_set_signature(proto_cfg.signature);
+
+	shell_print(shell, "Protocol signature set to 0x%08lx", sig);
+	return 0;
+}
+
+static int cmd_proto_role_set(const struct shell *shell, size_t argc, char **argv)
+{
+	if (argc != 2) {
+		shell_error(shell, "Usage: proto_role <disabled|tx|rx>");
+		return -EINVAL;
+	}
+
+	if (strcmp(argv[1], "disabled") == 0) {
+		proto_cfg.role = RADIO_PROTO_ROLE_DISABLED;
+	} else if (strcmp(argv[1], "tx") == 0) {
+		proto_cfg.role = RADIO_PROTO_ROLE_TX;
+	} else if (strcmp(argv[1], "rx") == 0) {
+		proto_cfg.role = RADIO_PROTO_ROLE_RX;
+	} else {
+		shell_error(shell, "Invalid role: %s", argv[1]);
+		return -EINVAL;
+	}
+
+	radio_proto_set_role(proto_cfg.role);
+	shell_print(shell, "Protocol role updated");
+	return 0;
+}
+
+static int cmd_proto_reset(const struct shell *shell, size_t argc, char **argv)
+{
+	radio_proto_reset();
+	shell_print(shell, "Protocol state reset");
+	return 0;
+}
+
+static int cmd_proto_status(const struct shell *shell, size_t argc, char **argv)
+{
+	struct radio_proto_status status;
+
+	radio_proto_get_status(&status);
+
+	shell_print(shell,
+		"proto role=%u sig=0x%08x discover_req=%u discover_rsp=%u test_data=%u per_req=%u per_rsp=%u local_test_rx=%u peers=%u",
+		status.role,
+		status.local_signature,
+		status.discover_req_seen,
+		status.discover_rsp_seen,
+		status.test_data_seen,
+		status.per_req_seen,
+		status.per_rsp_seen,
+		status.local_test_data_rx,
+		status.peer_count);
+
+	for (uint8_t i = 0; i < status.peer_count; i++) {
+		const struct radio_proto_peer *peer = &status.peers[i];
+
+		shell_print(shell,
+			"peer[%u] sig=0x%08x discover=%u per=%u reported_rx=%u",
+			i,
+			peer->signature,
+			peer->seen_discover_rsp,
+			peer->seen_per_rsp,
+			peer->reported_rx_packets);
+	}
+
+	return 0;
+}
+
+static int cmd_proto_rx_start(const struct shell *shell, size_t argc, char **argv)
+{
+	if (!proto_require_ieee_mode(shell)) {
+		return -EINVAL;
+	}
+
+	radio_proto_set_role(RADIO_PROTO_ROLE_RX);
+	proto_cfg.role = RADIO_PROTO_ROLE_RX;
+	proto_start_rx_continuous();
+	shell_print(shell, "Protocol RX started on channel %u", config.channel_start);
+	return 0;
+}
+
+static int cmd_proto_send_discover(const struct shell *shell, size_t argc, char **argv)
+{
+	uint32_t wait_ms = proto_cfg.discover_window_ms;
+	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
+	uint8_t peer_count;
+
+	if (argc > 2) {
+		shell_error(shell, "Usage: proto_send_discover [wait_ms]");
+		return -EINVAL;
+	}
+
+	if (argc == 2) {
+		wait_ms = strtoul(argv[1], NULL, 0);
+	}
+
+	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
+	proto_cfg.role = RADIO_PROTO_ROLE_TX;
+
+	if (proto_send_frame(shell,
+		RADIO_PROTO_CMD_DISCOVER_REQ,
+		0xFFFFFFFFu,
+		0,
+		1) != 0) {
+		return -EIO;
+	}
+
+	k_msleep(2);
+	proto_rx_window(wait_ms);
+	peer_count = radio_proto_get_peer_signatures(peer_sigs, ARRAY_SIZE(peer_sigs));
+	shell_print(shell, "DISCOVER complete: %u peers", peer_count);
+
+	return 0;
+}
+
+static int cmd_proto_send_test_data(const struct shell *shell, size_t argc, char **argv)
+{
+	uint32_t packets = proto_cfg.test_packets;
+
+	if (argc > 2) {
+		shell_error(shell, "Usage: proto_send_test_data [packets]");
+		return -EINVAL;
+	}
+
+	if (argc == 2) {
+		packets = strtoul(argv[1], NULL, 0);
+	}
+
+	if (packets == 0 || packets > UINT16_MAX) {
+		shell_error(shell, "packets must be in range 1..65535");
+		return -EINVAL;
+	}
+
+	proto_cfg.test_packets = packets;
+	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
+	proto_cfg.role = RADIO_PROTO_ROLE_TX;
+
+	return proto_send_frame(shell,
+		RADIO_PROTO_CMD_TEST_DATA,
+		0xFFFFFFFFu,
+		(uint16_t)packets,
+		packets);
+}
+
+static int cmd_proto_send_per_req(const struct shell *shell, size_t argc, char **argv)
+{
+	uint32_t dst_sig;
+	uint32_t expected;
+	uint32_t wait_ms = proto_cfg.per_wait_ms;
+	struct radio_proto_status status;
+	bool got_rsp = false;
+
+	if (argc < 3 || argc > 4) {
+		shell_error(shell, "Usage: proto_send_per_req <dst_sig> <expected_packets> [wait_ms]");
+		return -EINVAL;
+	}
+
+	dst_sig = strtoul(argv[1], NULL, 0);
+	expected = strtoul(argv[2], NULL, 0);
+	if (expected > UINT16_MAX) {
+		shell_error(shell, "expected_packets must be <= 65535");
+		return -EINVAL;
+	}
+
+	if (argc == 4) {
+		wait_ms = strtoul(argv[3], NULL, 0);
+	}
+
+	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
+	proto_cfg.role = RADIO_PROTO_ROLE_TX;
+
+	if (proto_send_frame(shell,
+		RADIO_PROTO_CMD_PER_REQ,
+		dst_sig,
+		(uint16_t)expected,
+		1) != 0) {
+		return -EIO;
+	}
+
+	k_msleep(2);
+	proto_rx_window(wait_ms);
+	radio_proto_get_status(&status);
+
+	for (uint8_t i = 0; i < status.peer_count; i++) {
+		if (status.peers[i].signature == dst_sig && status.peers[i].seen_per_rsp) {
+			shell_print(shell,
+				"PER response from 0x%08x: rx=%u expected=%u",
+				dst_sig,
+				status.peers[i].reported_rx_packets,
+				(unsigned int)expected);
+			got_rsp = true;
+			break;
+		}
+	}
+
+	if (!got_rsp) {
+		shell_print(shell, "No PER response from 0x%08x", dst_sig);
+	}
+
+	return 0;
+}
+
+static int cmd_proto_tx_run(const struct shell *shell, size_t argc, char **argv)
+{
+	uint32_t packets = proto_cfg.test_packets;
+	uint32_t discover_window_ms = proto_cfg.discover_window_ms;
+	uint32_t per_wait_ms = proto_cfg.per_wait_ms;
+	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
+	uint8_t peer_count;
+
+	if (argc > 4) {
+		shell_error(shell, "Usage: proto_tx_run [packets] [discover_ms] [per_wait_ms]");
+		return -EINVAL;
+	}
+
+	if (!proto_require_ieee_mode(shell)) {
+		return -EINVAL;
+	}
+
+	if (argc >= 2) {
+		packets = strtoul(argv[1], NULL, 0);
+	}
+	if (argc >= 3) {
+		discover_window_ms = strtoul(argv[2], NULL, 0);
+	}
+	if (argc == 4) {
+		per_wait_ms = strtoul(argv[3], NULL, 0);
+	}
+
+	if (packets == 0 || packets > UINT16_MAX) {
+		shell_error(shell, "packets must be in range 1..65535");
+		return -EINVAL;
+	}
+
+	proto_cfg.test_packets = packets;
+	proto_cfg.discover_window_ms = discover_window_ms;
+	proto_cfg.per_wait_ms = per_wait_ms;
+
+	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
+	radio_proto_reset();
+
+	shell_print(shell, "TX run: discover request");
+	if (proto_send_frame(shell, RADIO_PROTO_CMD_DISCOVER_REQ, 0xFFFFFFFFu, 0, 1) != 0) {
+		return -EIO;
+	}
+	k_msleep(2);
+	proto_rx_window(discover_window_ms);
+
+	peer_count = radio_proto_get_peer_signatures(peer_sigs, ARRAY_SIZE(peer_sigs));
+	shell_print(shell, "TX run: discovered %u peers", peer_count);
+
+	if (peer_count == 0) {
+		shell_print(shell, "No receivers responded to discover request");
+		return 0;
+	}
+
+	shell_print(shell, "TX run: sending %u TEST_DATA packets", packets);
+	if (proto_send_frame(shell,
+		    RADIO_PROTO_CMD_TEST_DATA,
+		    0xFFFFFFFFu,
+		    (uint16_t)packets,
+		    packets) != 0) {
+		return -EIO;
+	}
+	k_msleep(2);
+
+	for (uint8_t i = 0; i < peer_count; i++) {
+		shell_print(shell, "TX run: request PER from 0x%08x", peer_sigs[i]);
+		if (proto_send_frame(shell,
+		    RADIO_PROTO_CMD_PER_REQ,
+		    peer_sigs[i],
+		    (uint16_t)packets,
+		    1) != 0) {
+			continue;
+		}
+		k_msleep(2);
+		proto_rx_window(per_wait_ms);
+	}
+
+	cmd_proto_status(shell, 0, NULL);
+	return 0;
+}
+
 #if CONFIG_FEM
 static int cmd_fem(const struct shell *shell, size_t argc, char **argv)
 {
@@ -1485,6 +1894,33 @@ SHELL_CMD_REGISTER(start_rx_sweep, NULL, "Start RX sweep", cmd_rx_sweep_start);
 SHELL_CMD_REGISTER(start_tx_sweep, NULL, "Start TX sweep", cmd_tx_sweep_start);
 SHELL_CMD_REGISTER(start_rx, NULL, "Start RX", cmd_rx_start);
 SHELL_CMD_REGISTER(print_rx, NULL, "Print RX payload", cmd_print_payload);
+SHELL_CMD_REGISTER(proto_signature, NULL,
+		   "Set local protocol signature <u32>",
+		   cmd_proto_signature_set);
+SHELL_CMD_REGISTER(proto_role, NULL,
+		   "Set protocol role <disabled|tx|rx>",
+		   cmd_proto_role_set);
+SHELL_CMD_REGISTER(proto_reset, NULL,
+		   "Reset protocol counters and discovered peers",
+		   cmd_proto_reset);
+SHELL_CMD_REGISTER(proto_status, NULL,
+		   "Print protocol counters and peers",
+		   cmd_proto_status);
+SHELL_CMD_REGISTER(proto_rx_start, NULL,
+		   "Start protocol receiver loop",
+		   cmd_proto_rx_start);
+SHELL_CMD_REGISTER(proto_send_discover, NULL,
+		   "Send DISCOVER_REQ broadcast and listen for responses [wait_ms]",
+		   cmd_proto_send_discover);
+SHELL_CMD_REGISTER(proto_send_test_data, NULL,
+		   "Send TEST_DATA packets [packets]",
+		   cmd_proto_send_test_data);
+SHELL_CMD_REGISTER(proto_send_per_req, NULL,
+		   "Send PER_REQ <dst_sig> <expected_packets> [wait_ms]",
+		   cmd_proto_send_per_req);
+SHELL_CMD_REGISTER(proto_tx_run, NULL,
+		   "Run full TX flow [packets] [discover_ms] [per_wait_ms]",
+		   cmd_proto_tx_run);
 #if defined(TOGGLE_DCDC_HELP)
 SHELL_CMD_REGISTER(toggle_dcdc_state, NULL, TOGGLE_DCDC_HELP, cmd_toggle_dc);
 #endif
@@ -1497,6 +1933,8 @@ SHELL_CMD_REGISTER(fem,
 
 static int radio_cmd_init(void)
 {
+	int err;
+	struct radio_proto_status status;
 
 #if CONFIG_RADIO_TEST_POWER_CONTROL_AUTOMATIC
 	/* When front-end module is used, set output power to the front-end module
@@ -1505,7 +1943,17 @@ static int radio_cmd_init(void)
 	config.txpower = fem_default_tx_output_power_get();
 #endif /* CONFIG_RADIO_TEST_POWER_CONTROL_AUTOMATIC */
 
-	return radio_test_init(&test_config);
+	err = radio_test_init(&test_config);
+	if (err) {
+		return err;
+	}
+
+	radio_proto_get_status(&status);
+	proto_cfg.signature = status.local_signature;
+	radio_proto_set_signature(proto_cfg.signature);
+	radio_proto_set_role(proto_cfg.role);
+
+	return 0;
 }
 
 SYS_INIT(radio_cmd_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);

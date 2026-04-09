@@ -33,6 +33,7 @@
 #define IEEE_MIN_CHANNEL	11
 /** IEEE 802.15.4 maximum channel. */
 #define IEEE_MAX_CHANNEL	26
+#define RADIO_PROTO_MAX_PEERS 16
 
 #define FEM_USE_DEFAULT_TX_POWER_CONTROL 0xFF
 
@@ -196,6 +197,41 @@ struct radio_rx_stats {
 	uint32_t packet_cnt;
 };
 
+enum radio_proto_role {
+	RADIO_PROTO_ROLE_DISABLED = 0,
+	RADIO_PROTO_ROLE_TX,
+	RADIO_PROTO_ROLE_RX,
+};
+
+enum radio_proto_cmd {
+	RADIO_PROTO_CMD_DISCOVER_REQ = 1,
+	RADIO_PROTO_CMD_DISCOVER_RSP,
+	RADIO_PROTO_CMD_TEST_DATA,
+	RADIO_PROTO_CMD_PER_REQ,
+	RADIO_PROTO_CMD_PER_RSP,
+};
+
+struct radio_proto_peer {
+	uint32_t signature;
+	uint32_t rx_test_packets;
+	uint16_t reported_rx_packets;
+	bool seen_discover_rsp;
+	bool seen_per_rsp;
+};
+
+struct radio_proto_status {
+	enum radio_proto_role role;
+	uint32_t local_signature;
+	uint32_t discover_req_seen;
+	uint32_t discover_rsp_seen;
+	uint32_t test_data_seen;
+	uint32_t per_req_seen;
+	uint32_t per_rsp_seen;
+	uint32_t local_test_data_rx;
+	uint8_t peer_count;
+	struct radio_proto_peer peers[RADIO_PROTO_MAX_PEERS];
+};
+
 /**
  * @brief Function for initializing the Radio Test module.
  *
@@ -233,5 +269,19 @@ void radio_rx_stats_get(struct radio_rx_stats *rx_stats);
  * @param[in] dcdc_state  DC/DC converter state.
  */
 void toggle_dcdc_state(uint8_t dcdc_state);
+
+void radio_proto_set_signature(uint32_t signature);
+
+void radio_proto_set_role(enum radio_proto_role role);
+
+enum radio_proto_role radio_proto_get_role(void);
+
+void radio_proto_reset(void);
+
+int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value);
+
+void radio_proto_get_status(struct radio_proto_status *status);
+
+uint8_t radio_proto_get_peer_signatures(uint32_t *signatures, uint8_t max_count);
 
 #endif /* RADIO_TEST_H_ */
