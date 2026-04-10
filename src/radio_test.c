@@ -5,7 +5,7 @@
  */
 
 #include "radio_test.h"
-
+#include "local_config.h"
 #include <string.h>
 #include <inttypes.h>
 
@@ -121,10 +121,10 @@ static void (**rx_timeout_cb)(void);
 static volatile bool cancel_request;
 static volatile bool test_is_running;
 
-#define RADIO_PROTO_MAGIC0             0xA5
-#define RADIO_PROTO_MAGIC1             0x5A
-#define RADIO_PROTO_VERSION            1
-#define RADIO_PROTO_BROADCAST_SIG      0xFFFFFFFFu
+#define RADIO_PROTO_MAGIC0             0xA5 				//Frame Delimiter
+#define RADIO_PROTO_MAGIC1             0x5A 				//Frame Delimiter
+#define RADIO_PROTO_VERSION            1						//Future Proof
+#define RADIO_PROTO_BROADCAST_SIG      0xFFFFFFFFu	//Broadcast to all
 #define RADIO_PROTO_HEADER_SIZE        15
 
 struct radio_proto_frame {
@@ -784,8 +784,6 @@ static void radio_config(nrf_radio_mode_t mode, enum transmit_pattern pattern)
 
 		/* Set CRC length for IEEE 802.15.4 (2 bytes FCS) so CRCOK is reported */
 #if defined(RADIO_CRCCNF_LEN_Two)
-		//nrf_radio_crc_configure(NRF_RADIO, RADIO_CRCCNF_LEN_Two,
-		//			NRF_RADIO_CRC_ADDR_INCLUDE, 0);
 		nrf_radio_crc_configure(NRF_RADIO,
 			RADIO_CRCCNF_LEN_Two,
 			NRF_RADIO_CRC_ADDR_SKIP,
@@ -1084,9 +1082,7 @@ static void radio_modulated_tx_carrier(uint8_t mode, int8_t txpower, uint8_t cha
 	radio_power_set(mode, channel, txpower);
 
 	radio_channel_set(mode, channel);
-
 	tx_packet_cnt = 0;
-
 
 #if CONFIG_FEM
 	(void)fem_configure(false, mode, &fem);
@@ -1184,6 +1180,7 @@ static void radio_modulated_tx_carrier_duty_cycle(uint8_t mode, int8_t txpower,
 				RADIO_TEST_SHORT_END_DISABLE_MASK);
 	radio_power_set(mode, channel, txpower);
 	radio_channel_set(mode, channel);
+	tx_packet_cnt = 0;
 	nrf_radio_event_clear(NRF_RADIO, RADIO_TEST_EVENT_END);
 	nrf_radio_int_enable(NRF_RADIO, RADIO_TEST_INT_END_MASK);
 
@@ -1424,17 +1421,35 @@ static void timer_init(const struct radio_test_config *config)
 void on_radio_end(const struct radio_test_config *config)
 {
 	tx_packet_cnt++;
-	if (tx_packet_cnt == config->params.modulated_tx.packets_num &&
-	    config->type == MODULATED_TX) {
+
+	uint32_t packets_num;
+	void (*cb)(void);
+
+	if (config->type == MODULATED_TX) {
+		packets_num = config->params.modulated_tx.packets_num;
+		cb = config->params.modulated_tx.cb;
+	} else if (config->type == MODULATED_TX_DUTY_CYCLE) {
+		packets_num = config->params.modulated_tx_duty_cycle.packets_num;
+		cb = config->params.modulated_tx_duty_cycle.cb;
+	} else {
+		return;
+	}
+
+	if (packets_num != 0 && tx_packet_cnt >= packets_num) {
 		radio_disable();
 		/* Send off signal for nRF54H20 errata HMPAN-216 */
 		if (errata_216_off()) {
 			printk("Failed to send errata HMPAN-216 off\n");
 		}
-		config->params.modulated_tx.cb();
+		if (cb != NULL) {
+			cb();
+		}
 	} else if (cancel_request) {
 		cancel();
 	} else if (config->type == MODULATED_TX) {
+		/* Duty cycle mode re-triggers via hardware timer; plain MODULATED_TX
+		 * must retrigger manually here.
+		 */
 		nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_START);
 	}
 }
@@ -1461,6 +1476,7 @@ void radio_handler(const void *context)
 
 				switch (frame.cmd) {
 				case RADIO_PROTO_CMD_DISCOVER_REQ:
+					if (VERBOSE_LOGGING) printk("Received DISCOVER_REQ from 0x%08X\n", frame.src_signature);
 					proto_discover_req_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature)) {
@@ -1470,6 +1486,7 @@ void radio_handler(const void *context)
 					}
 					break;
 				case RADIO_PROTO_CMD_DISCOVER_RSP:
+					if (VERBOSE_LOGGING) printk("Received DISCOVER_RSP from 0x%08X\n", frame.src_signature);
 					proto_discover_rsp_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_TX &&
 					    proto_frame_for_me(frame.dst_signature)) {
@@ -1477,11 +1494,13 @@ void radio_handler(const void *context)
 							proto_find_or_add_peer(frame.src_signature);
 
 						if (peer != NULL) {
+							if (VERBOSE_LOGGING) printk("Discovered peer 0x%08X\n", frame.src_signature);
 							peer->seen_discover_rsp = true;
 						}
 					}
 					break;
 				case RADIO_PROTO_CMD_TEST_DATA:
+					if (VERBOSE_LOGGING_ALL) printk("Received TEST_DATA from 0x%08X\n", frame.src_signature);
 					proto_test_data_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature)) {
@@ -1489,6 +1508,7 @@ void radio_handler(const void *context)
 					}
 					break;
 				case RADIO_PROTO_CMD_PER_REQ:
+					if (VERBOSE_LOGGING) printk("Received PER_REQ from 0x%08X\n", frame.src_signature);
 					proto_per_req_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature)) {
@@ -1499,6 +1519,7 @@ void radio_handler(const void *context)
 					}
 					break;
 				case RADIO_PROTO_CMD_PER_RSP:
+					if (VERBOSE_LOGGING) printk("Received PER_RSP from 0x%08X\n", frame.src_signature);
 					proto_per_rsp_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_TX &&
 					    proto_frame_for_me(frame.dst_signature)) {
@@ -1506,6 +1527,7 @@ void radio_handler(const void *context)
 							proto_find_or_add_peer(frame.src_signature);
 
 						if (peer != NULL) {
+							if (VERBOSE_LOGGING) printk("Received PER_RSP from peer 0x%08X with value %u\n", frame.src_signature, frame.value);
 							peer->seen_per_rsp = true;
 							peer->reported_rx_packets = frame.value;
 						}
@@ -1541,7 +1563,8 @@ void radio_handler(const void *context)
 				 proto_rx_channel,
 				 proto_rx_pattern,
 				 0);
-		} else if (config->type == MODULATED_TX) {
+		} else if (config->type == MODULATED_TX ||
+			   config->type == MODULATED_TX_DUTY_CYCLE) {
 			on_radio_end(config);
 		}
 	}
@@ -1551,23 +1574,8 @@ void radio_handler(const void *context)
 		nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_END)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_END);
 
-		/* If this is a RX test and CRCOK did not fire, dump the received
-		 * buffer so we can see what arrived on-air. Do not call
-		 * on_radio_end() for RX since that function is for TX handling.
-		 */
-		if (config->type == RX) {
-			/* Print a short diagnostic when an END occurs without CRCOK. */
-			printk("radio_handler: END event (RX) — CRCOK not set, dumping first bytes:\n");
-			uint8_t payload_len = rx_packet[0];
-			unsigned int dump_len = (unsigned int)(payload_len + 1);
-			if (dump_len > 16) {
-				dump_len = 16;
-			}
-			for (unsigned int i = 0; i < dump_len; i++) {
-				printk("%02X ", rx_packet[i]);
-			}
-			printk("\n");
-		} else if (config->type == MODULATED_TX) {
+		if (config->type == MODULATED_TX ||
+		    config->type == MODULATED_TX_DUTY_CYCLE) {
 			on_radio_end(config);
 		}
 	}

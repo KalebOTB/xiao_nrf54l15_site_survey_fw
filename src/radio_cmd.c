@@ -5,7 +5,7 @@
  */
 
 #include <stdlib.h>
-
+#include "local_config.h"
 #include <errno.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
@@ -328,18 +328,19 @@ static int cmd_tx_modulated_carrier_start(const struct shell *shell,
 	}
 
 	memset(&test_config, 0, sizeof(test_config));
-	test_config.type = MODULATED_TX;
 	test_config.mode = config.mode;
-	test_config.params.modulated_tx.txpower = config.txpower;
-	test_config.params.modulated_tx.channel = config.channel_start;
-	test_config.params.modulated_tx.pattern = config.tx_pattern;
+	test_config.type = MODULATED_TX_DUTY_CYCLE;
+	test_config.params.modulated_tx_duty_cycle.txpower = config.txpower;
+	test_config.params.modulated_tx_duty_cycle.channel = config.channel_start;
+	test_config.params.modulated_tx_duty_cycle.pattern = config.tx_pattern;
+	test_config.params.modulated_tx_duty_cycle.duty_cycle = config.duty_cycle;
 #if CONFIG_FEM
 	test_config.fem = config.fem;
 #endif /* CONFIG_FEM */
 
 	if (argc == 2) {
-		test_config.params.modulated_tx.packets_num = atoi(argv[1]);
-		test_config.params.modulated_tx.cb = tx_modulated_carrier_end;
+		test_config.params.modulated_tx_duty_cycle.packets_num = atoi(argv[1]);
+		test_config.params.modulated_tx_duty_cycle.cb = tx_modulated_carrier_end;
 	}
 
 	radio_test_start(&test_config);
@@ -1194,6 +1195,9 @@ static int cmd_print_payload(const struct shell *shell, size_t argc,
 
 static void proto_single_tx_done(void)
 {
+	if (VERBOSE_LOGGING_ALL) {
+		printk("TX DONE SIGNAL GIVEN\n");
+	}
 	k_sem_give(&proto_tx_done_sem);
 }
 
@@ -1231,13 +1235,29 @@ static int proto_send_frame(const struct shell *shell, enum radio_proto_cmd cmd,
 	}
 
 	memset(&test_config, 0, sizeof(test_config));
-	test_config.type = MODULATED_TX;
 	test_config.mode = config.mode;
-	test_config.params.modulated_tx.txpower = config.txpower;
-	test_config.params.modulated_tx.channel = config.channel_start;
-	test_config.params.modulated_tx.pattern = TRANSMIT_PATTERN_RANDOM;
-	test_config.params.modulated_tx.packets_num = packets_num;
-	test_config.params.modulated_tx.cb = proto_single_tx_done;
+	if (packets_num == 1u) {
+		/* Single protocol control frames (e.g. discover/per request) should
+		 * use plain MODULATED_TX for deterministic one-shot timing.
+		 */
+		test_config.type = MODULATED_TX;
+		test_config.params.modulated_tx.txpower = config.txpower;
+		test_config.params.modulated_tx.channel = config.channel_start;
+		test_config.params.modulated_tx.pattern = TRANSMIT_PATTERN_RANDOM;
+		test_config.params.modulated_tx.packets_num = packets_num;
+		test_config.params.modulated_tx.cb = proto_single_tx_done;
+	} else {
+		/* Multi-packet data bursts use duty cycle pacing so packets are spaced
+		 * without CPU busy-wait loops.
+		 */
+		test_config.type = MODULATED_TX_DUTY_CYCLE;
+		test_config.params.modulated_tx_duty_cycle.txpower = config.txpower;
+		test_config.params.modulated_tx_duty_cycle.channel = config.channel_start;
+		test_config.params.modulated_tx_duty_cycle.pattern = TRANSMIT_PATTERN_RANDOM;
+		test_config.params.modulated_tx_duty_cycle.duty_cycle = config.duty_cycle;
+		test_config.params.modulated_tx_duty_cycle.packets_num = packets_num;
+		test_config.params.modulated_tx_duty_cycle.cb = proto_single_tx_done;
+	}
 #if CONFIG_FEM
 	test_config.fem = config.fem;
 #endif /* CONFIG_FEM */
@@ -1247,11 +1267,25 @@ static int proto_send_frame(const struct shell *shell, enum radio_proto_cmd cmd,
 		/* Do nothing */
 	}
 
+	if (VERBOSE_LOGGING_ALL) {
+	printk("Starting protocol TX: cmd=%u dst_sig=0x%08x value=%u packets=%u\n",
+		(unsigned int)cmd,
+		dst_signature,
+		value,
+		(unsigned int)packets_num);
+	}
 	radio_test_start(&test_config);
 
 	/* Conservative timeout so TX flow does not preempt an active burst. */
-	timeout_ms = MAX(1000u, packets_num * 4u + 300u);
+	timeout_ms = MAX(10000u, packets_num * 40u + 300u);
 	sem_err = k_sem_take(&proto_tx_done_sem, K_MSEC(timeout_ms));
+	if (VERBOSE_LOGGING_ALL) {
+		printk("Protocol TX completed: cmd=%u dst_sig=0x%08x value=%u packets=%u\n",
+			(unsigned int)cmd,
+			dst_signature,
+			value,
+			(unsigned int)packets_num);
+	}
 	if (sem_err != 0) {
 		shell_error(shell,
 			"Timed out waiting for TX completion (cmd=%u packets=%u timeout_ms=%u)",
@@ -1508,6 +1542,7 @@ static int cmd_proto_tx_run(const struct shell *shell, size_t argc, char **argv)
 	uint32_t per_wait_ms = proto_cfg.per_wait_ms;
 	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
 	uint8_t peer_count;
+	struct radio_proto_status status;
 
 	if (argc > 4) {
 		shell_error(shell, "Usage: proto_tx_run [packets] [discover_ms] [per_wait_ms]");
@@ -1563,19 +1598,48 @@ static int cmd_proto_tx_run(const struct shell *shell, size_t argc, char **argv)
 		    packets) != 0) {
 		return -EIO;
 	}
-	k_msleep(2);
+
+	/* Wait for the last TEST_DATA packet to propagate before requesting PER. */
+	k_msleep(per_wait_ms);
 
 	for (uint8_t i = 0; i < peer_count; i++) {
-		shell_print(shell, "TX run: request PER from 0x%08x", peer_sigs[i]);
-		if (proto_send_frame(shell,
-		    RADIO_PROTO_CMD_PER_REQ,
-		    peer_sigs[i],
-		    (uint16_t)packets,
-		    1) != 0) {
-			continue;
+		bool got_rsp = false;
+
+		for (uint8_t attempt = 0; attempt < 3 && !got_rsp; attempt++) {
+			shell_print(shell,
+				"TX run: request PER from 0x%08x (attempt %u)",
+				peer_sigs[i],
+				(unsigned int)(attempt + 1));
+
+			if (proto_send_frame(shell,
+			    RADIO_PROTO_CMD_PER_REQ,
+			    peer_sigs[i],
+			    (uint16_t)packets,
+			    1) != 0) {
+				continue;
+			}
+
+			k_msleep(2);
+			proto_rx_window(per_wait_ms);
+			radio_proto_get_status(&status);
+
+			for (uint8_t p = 0; p < status.peer_count; p++) {
+				if (status.peers[p].signature == peer_sigs[i] &&
+				    status.peers[p].seen_per_rsp) {
+					got_rsp = true;
+					break;
+				}
+			}
+
+			if (!got_rsp) {
+				/* Small spacing before retry to avoid edge timing misses. */
+				k_msleep(20);
+			}
 		}
-		k_msleep(2);
-		proto_rx_window(per_wait_ms);
+
+		if (!got_rsp) {
+			shell_print(shell, "TX run: no PER response from 0x%08x after retries", peer_sigs[i]);
+		}
 	}
 
 	cmd_proto_status(shell, 0, NULL);

@@ -33,7 +33,7 @@
 #define IEEE_MIN_CHANNEL	11
 /** IEEE 802.15.4 maximum channel. */
 #define IEEE_MAX_CHANNEL	26
-#define RADIO_PROTO_MAX_PEERS 16
+#define RADIO_PROTO_MAX_PEERS 64
 
 #define FEM_USE_DEFAULT_TX_POWER_CONTROL 0xFF
 
@@ -117,6 +117,9 @@ struct radio_test_config {
 
 			/** Callback to indicate that TX is finished. */
 			void (*cb)(void);
+
+			/** Inter-packet delay in microseconds. */
+			//uint32_t inter_packet_delay_us;
 		} modulated_tx;
 
 		struct {
@@ -173,6 +176,15 @@ struct radio_test_config {
 
 			/** Duty cycle. */
 			uint32_t duty_cycle;
+
+			/**
+			 * Number of packets to transmit.
+			 * Set to zero for continuous TX.
+			 */
+			uint32_t packets_num;
+
+			/** Callback to indicate that TX is finished. */
+			void (*cb)(void);
 		} modulated_tx_duty_cycle;
 	} params;
 

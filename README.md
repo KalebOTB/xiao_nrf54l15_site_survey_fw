@@ -74,7 +74,7 @@ If you want to debug intermediate steps or use custom patterns:
 **RX Device 1:**
 ```bash
 data_rate ieee802154_250Kbit
-start_channel 15
+start_channel 18
 proto_signature 0x87654321
 proto_role rx
 proto_rx_start     # Passive listening, auto-responds to all requests
@@ -83,7 +83,7 @@ proto_rx_start     # Passive listening, auto-responds to all requests
 **RX Device 2:**
 ```bash
 data_rate ieee802154_250Kbit
-start_channel 15
+start_channel 18
 proto_signature 0xAABBCCDD
 proto_role rx
 proto_rx_start
@@ -92,10 +92,12 @@ proto_rx_start
 **TX Device:**
 ```bash
 data_rate ieee802154_250Kbit
-start_channel 15
+start_channel 18
 proto_signature 0x12345678
 proto_role tx
+proto_tx_run 100 250 80
 
+proto_send_test_data 100
 # Send discovery request
 proto_send_discover
 # RX devices automatically reply after random backoff (15-39 ms)
