@@ -5,6 +5,7 @@
  */
 
 #include "radio_test.h"
+#include "radio_node.h"
 #include "local_config.h"
 #include <string.h>
 #include <inttypes.h>
@@ -124,16 +125,7 @@ static volatile bool test_is_running;
 #define RADIO_PROTO_MAGIC0             0xA5 				//Frame Delimiter
 #define RADIO_PROTO_MAGIC1             0x5A 				//Frame Delimiter
 #define RADIO_PROTO_VERSION            1						//Future Proof
-#define RADIO_PROTO_BROADCAST_SIG      0xFFFFFFFFu	//Broadcast to all
-#define RADIO_PROTO_HEADER_SIZE        15
-
-struct radio_proto_frame {
-	uint8_t cmd;
-	uint8_t flags;
-	uint32_t src_signature;
-	uint32_t dst_signature;
-	uint16_t value;
-};
+#define RADIO_PROTO_HEADER_SIZE        19
 
 static enum radio_proto_role proto_role = RADIO_PROTO_ROLE_DISABLED;
 static uint32_t proto_local_signature;
@@ -662,7 +654,8 @@ static bool proto_frame_decode(const uint8_t *payload, uint8_t payload_len,
 	frame->flags = payload[4];
 	frame->src_signature = proto_u32_get_le(&payload[5]);
 	frame->dst_signature = proto_u32_get_le(&payload[9]);
-	frame->value = proto_u16_get_le(&payload[13]);
+	frame->aux_signature = proto_u32_get_le(&payload[13]);
+	frame->value = proto_u16_get_le(&payload[17]);
 
 	return true;
 }
@@ -671,9 +664,10 @@ static uint8_t proto_frame_encode(uint8_t *payload, size_t payload_capacity,
 			      enum radio_proto_cmd cmd,
 			      uint32_t src_signature,
 			      uint32_t dst_signature,
+			      uint32_t aux_signature,
 			      uint16_t value)
 {
-	if (payload_capacity < 15) {
+	if (payload_capacity < RADIO_PROTO_HEADER_SIZE) {
 		return 0;
 	}
 
@@ -684,9 +678,10 @@ static uint8_t proto_frame_encode(uint8_t *payload, size_t payload_capacity,
 	payload[4] = proto_seq++;
 	proto_u32_put_le(&payload[5], src_signature);
 	proto_u32_put_le(&payload[9], dst_signature);
-	proto_u16_put_le(&payload[13], value);
+	proto_u32_put_le(&payload[13], aux_signature);
+	proto_u16_put_le(&payload[17], value);
 
-	return 15;
+	return RADIO_PROTO_HEADER_SIZE;
 }
 
 static bool proto_frame_for_me(uint32_t dst_signature)
@@ -695,7 +690,7 @@ static bool proto_frame_for_me(uint32_t dst_signature)
 	       (dst_signature == proto_local_signature);
 }
 
-static void proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
+void radio_proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
 {
 	if (proto_role != RADIO_PROTO_ROLE_RX) {
 		return;
@@ -1469,21 +1464,15 @@ void radio_handler(const void *context)
 			struct radio_proto_frame frame;
 			bool frame_ok = proto_frame_decode(rx_packet + 1, payload_len, &frame);
 
-			if (proto_role == RADIO_PROTO_ROLE_DISABLED) {
-				rx_packet_cnt++;
-			} else if (frame_ok) {
+			if (frame_ok) {
 				rx_packet_cnt++;
 
 				switch (frame.cmd) {
 				case RADIO_PROTO_CMD_DISCOVER_REQ:
 					if (VERBOSE_LOGGING) printk("Received DISCOVER_REQ from 0x%08X\n", frame.src_signature);
 					proto_discover_req_seen++;
-					if (proto_role == RADIO_PROTO_ROLE_RX &&
-					    proto_frame_for_me(frame.dst_signature)) {
-						proto_schedule_response(RADIO_PROTO_CMD_DISCOVER_RSP,
-								      frame.src_signature,
-								      0);
-					}
+					radio_node_handle_discover_req(frame.src_signature,
+							      frame.dst_signature);
 					break;
 				case RADIO_PROTO_CMD_DISCOVER_RSP:
 					if (VERBOSE_LOGGING) printk("Received DISCOVER_RSP from 0x%08X\n", frame.src_signature);
@@ -1512,7 +1501,7 @@ void radio_handler(const void *context)
 					proto_per_req_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature)) {
-						proto_schedule_response(RADIO_PROTO_CMD_PER_RSP,
+						radio_proto_schedule_response(RADIO_PROTO_CMD_PER_RSP,
 								      frame.src_signature,
 								      (uint16_t)MIN(proto_local_test_data_rx,
 										  UINT16_MAX));
@@ -1533,9 +1522,55 @@ void radio_handler(const void *context)
 						}
 					}
 					break;
+				case RADIO_PROTO_CMD_CLEAR_PER_REQ:
+					if (VERBOSE_LOGGING) printk("Received CLEAR_PER_REQ from 0x%08X\n", frame.src_signature);
+					if (proto_role == RADIO_PROTO_ROLE_RX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						proto_local_test_data_rx = 0;
+						radio_proto_schedule_response(RADIO_PROTO_CMD_CLEAR_PER_RSP,
+									      frame.src_signature,
+									      0);
+					}
+					break;
+				case RADIO_PROTO_CMD_CLEAR_PER_RSP:
+					if (VERBOSE_LOGGING) printk("Received CLEAR_PER_RSP from 0x%08X\n", frame.src_signature);
+					if (proto_role == RADIO_PROTO_ROLE_TX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						struct radio_proto_peer *peer =
+							proto_find_or_add_peer(frame.src_signature);
+
+						if (peer != NULL) {
+							peer->seen_clear_per_rsp = true;
+						}
+					}
+					break;
+				case RADIO_PROTO_CMD_RELEASE_REQ:
+					radio_node_handle_proto_frame(&frame);
+					break;
+				case RADIO_PROTO_CMD_RELEASE_RSP:
+					if (VERBOSE_LOGGING) printk("Received RELEASE_RSP from 0x%08X\n", frame.src_signature);
+					if (proto_role == RADIO_PROTO_ROLE_TX &&
+					    proto_frame_for_me(frame.dst_signature)) {
+						struct radio_proto_peer *peer =
+							proto_find_or_add_peer(frame.src_signature);
+
+						if (peer != NULL) {
+							peer->seen_release_rsp = true;
+						}
+					}
+					break;
+				case RADIO_PROTO_CMD_REMOTE_TEST_REQ:
+				case RADIO_PROTO_CMD_REMOTE_TEST_REPORT:
+				case RADIO_PROTO_CMD_REMOTE_TEST_DONE:
+				case RADIO_PROTO_CMD_PROVISION_REQ:
+				case RADIO_PROTO_CMD_PROVISION_RSP:
+					radio_node_handle_proto_frame(&frame);
+					break;
 				default:
 					break;
 				}
+			} else {
+				rx_packet_cnt++;
 			}
 		} else {
 			rx_packet_cnt++;
@@ -1634,7 +1669,8 @@ void radio_proto_reset(void)
 	memset(proto_peers, 0, sizeof(proto_peers));
 }
 
-int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
+int radio_proto_prepare_tx_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
+			       uint16_t value, uint32_t aux_signature)
 {
 	uint8_t len;
 
@@ -1647,6 +1683,7 @@ int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uin
 				 cmd,
 				 proto_local_signature,
 				 dst_signature,
+				 aux_signature,
 				 value);
 	if (len == 0) {
 		return -EINVAL;
@@ -1656,6 +1693,11 @@ int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uin
 	proto_tx_override_valid = true;
 
 	return 0;
+}
+
+int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
+{
+	return radio_proto_prepare_tx_ext(cmd, dst_signature, value, 0u);
 }
 
 void radio_proto_get_status(struct radio_proto_status *status)
@@ -1688,6 +1730,49 @@ uint8_t radio_proto_get_peer_signatures(uint32_t *signatures, uint8_t max_count)
 	}
 
 	return count;
+}
+
+void radio_proto_clear_peer_list(void)
+{
+	proto_peer_count = 0;
+	memset(proto_peers, 0, sizeof(proto_peers));
+	proto_discover_rsp_seen = 0;
+	proto_per_rsp_seen = 0;
+}
+
+void radio_proto_reset_discover_round(void)
+{
+	proto_discover_req_seen = 0;
+	proto_discover_rsp_seen = 0;
+
+	for (uint8_t i = 0; i < proto_peer_count; i++) {
+		proto_peers[i].seen_discover_rsp = false;
+	}
+}
+
+void radio_proto_reset_per_results(void)
+{
+	proto_per_req_seen = 0;
+	proto_per_rsp_seen = 0;
+
+	for (uint8_t i = 0; i < proto_peer_count; i++) {
+		proto_peers[i].seen_per_rsp = false;
+		proto_peers[i].reported_rx_packets = 0;
+	}
+}
+
+void radio_proto_reset_clear_per_results(void)
+{
+	for (uint8_t i = 0; i < proto_peer_count; i++) {
+		proto_peers[i].seen_clear_per_rsp = false;
+	}
+}
+
+void radio_proto_reset_release_results(void)
+{
+	for (uint8_t i = 0; i < proto_peer_count; i++) {
+		proto_peers[i].seen_release_rsp = false;
+	}
 }
 
 int radio_test_init(struct radio_test_config *config)

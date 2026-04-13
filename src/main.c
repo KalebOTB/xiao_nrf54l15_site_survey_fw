@@ -5,8 +5,11 @@
  */
 
 #include <zephyr/sys/printk.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/kernel.h>
 #include <zephyr/pm/device_runtime.h>
 #if defined(NRF54L15_XXAA)
 #include <hal/nrf_clock.h>
@@ -22,8 +25,107 @@
 #include <hal/nrf_clock.h>
 #endif /* defined(NRF54LM20A_ENGA_XXAA) */
 
+#include "radio_node.h"
+
 /* Empty trim value */
 #define TRIM_VALUE_EMPTY 0xFFFFFFFF
+
+#define LED0_NODE DT_ALIAS(led0)
+#define SW0_NODE DT_ALIAS(sw0)
+
+#if DT_NODE_HAS_STATUS(LED0_NODE, okay)
+static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+static struct k_work_delayable led_work;
+static bool led_blink_state;
+#endif
+
+#if DT_NODE_HAS_STATUS(SW0_NODE, okay)
+static const struct gpio_dt_spec user_button = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
+static struct gpio_callback button_cb_data;
+static struct k_work button_work;
+static int64_t last_button_press_ms;
+#endif
+
+#if DT_NODE_HAS_STATUS(LED0_NODE, okay)
+static void led_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!device_is_ready(status_led.port)) {
+		return;
+	}
+
+	if (radio_node_led_should_blink()) {
+		led_blink_state = !led_blink_state;
+		gpio_pin_set_dt(&status_led, led_blink_state ? 1 : 0);
+	} else {
+		led_blink_state = false;
+		gpio_pin_set_dt(&status_led, radio_node_led_should_be_on() ? 1 : 0);
+	}
+
+	k_work_reschedule(&led_work, K_MSEC(250));
+}
+#endif
+
+#if DT_NODE_HAS_STATUS(SW0_NODE, okay)
+static void button_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	radio_node_handle_button_press();
+}
+
+static void button_pressed(const struct device *dev, struct gpio_callback *cb,
+			   uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+
+	if ((pins & BIT(user_button.pin)) == 0u) {
+		return;
+	}
+
+	if ((k_uptime_get() - last_button_press_ms) < 250) {
+		return;
+	}
+
+	last_button_press_ms = k_uptime_get();
+	k_work_submit(&button_work);
+}
+#endif
+
+static void node_ui_init(void)
+{
+#if DT_NODE_HAS_STATUS(LED0_NODE, okay)
+	if (gpio_is_ready_dt(&status_led)) {
+		gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
+		k_work_init_delayable(&led_work, led_work_handler);
+		k_work_reschedule(&led_work, K_NO_WAIT);
+	} else {
+		printk("Status LED not ready\n");
+	}
+#endif
+
+#if DT_NODE_HAS_STATUS(SW0_NODE, okay)
+	if (gpio_is_ready_dt(&user_button)) {
+		int err;
+
+		k_work_init(&button_work, button_work_handler);
+		err = gpio_pin_configure_dt(&user_button, GPIO_INPUT);
+		if (err == 0) {
+			err = gpio_pin_interrupt_configure_dt(&user_button, GPIO_INT_EDGE_TO_ACTIVE);
+		}
+		if (err == 0) {
+			gpio_init_callback(&button_cb_data, button_pressed, BIT(user_button.pin));
+			err = gpio_add_callback(user_button.port, &button_cb_data);
+		}
+		if (err != 0) {
+			printk("Button init failed: %d\n", err);
+		}
+	} else {
+		printk("User button not ready\n");
+	}
+#endif
+}
 
 #if defined(CONFIG_CLOCK_CONTROL_NRF)
 static void clock_init(void)
@@ -188,6 +290,7 @@ int main(void)
 #endif /* defined(CONFIG_SOC_SERIES_NRF54HX) */
 
 	clock_init();
+	node_ui_init();
 
 #if defined(CONFIG_SOC_SERIES_NRF54HX)
 	nrf54hx_radio_trim();

@@ -29,6 +29,7 @@
 #define RADIO_MAX_PAYLOAD_LEN	256
 /** IEEE 802.15.4 maximum payload length. */
 #define IEEE_MAX_PAYLOAD_LEN	127
+#define RADIO_PROTO_BROADCAST_SIG 0xFFFFFFFFu
 /** IEEE 802.15.4 minimum channel. */
 #define IEEE_MIN_CHANNEL	11
 /** IEEE 802.15.4 maximum channel. */
@@ -221,6 +222,24 @@ enum radio_proto_cmd {
 	RADIO_PROTO_CMD_TEST_DATA,
 	RADIO_PROTO_CMD_PER_REQ,
 	RADIO_PROTO_CMD_PER_RSP,
+	RADIO_PROTO_CMD_CLEAR_PER_REQ,
+	RADIO_PROTO_CMD_CLEAR_PER_RSP,
+	RADIO_PROTO_CMD_RELEASE_REQ,
+	RADIO_PROTO_CMD_RELEASE_RSP,
+	RADIO_PROTO_CMD_REMOTE_TEST_REQ,
+	RADIO_PROTO_CMD_REMOTE_TEST_REPORT,
+	RADIO_PROTO_CMD_REMOTE_TEST_DONE,
+	RADIO_PROTO_CMD_PROVISION_REQ,
+	RADIO_PROTO_CMD_PROVISION_RSP,
+};
+
+struct radio_proto_frame {
+	uint8_t cmd;
+	uint8_t flags;
+	uint32_t src_signature;
+	uint32_t dst_signature;
+	uint32_t aux_signature;
+	uint16_t value;
 };
 
 struct radio_proto_peer {
@@ -229,6 +248,8 @@ struct radio_proto_peer {
 	uint16_t reported_rx_packets;
 	bool seen_discover_rsp;
 	bool seen_per_rsp;
+	bool seen_clear_per_rsp;
+	bool seen_release_rsp;
 };
 
 struct radio_proto_status {
@@ -292,8 +313,24 @@ void radio_proto_reset(void);
 
 int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value);
 
+int radio_proto_prepare_tx_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
+			       uint16_t value, uint32_t aux_signature);
+
+void radio_proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature,
+				       uint16_t value);
+
 void radio_proto_get_status(struct radio_proto_status *status);
 
 uint8_t radio_proto_get_peer_signatures(uint32_t *signatures, uint8_t max_count);
+
+void radio_proto_clear_peer_list(void);
+
+void radio_proto_reset_discover_round(void);
+
+void radio_proto_reset_per_results(void);
+
+void radio_proto_reset_clear_per_results(void);
+
+void radio_proto_reset_release_results(void);
 
 #endif /* RADIO_TEST_H_ */
