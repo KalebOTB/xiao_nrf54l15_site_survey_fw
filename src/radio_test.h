@@ -36,6 +36,9 @@
 #define IEEE_MAX_CHANNEL	26
 #define RADIO_PROTO_MAX_PEERS 64
 
+#define RADIO_SURVEY_PROFILE_TYPE_MASK 0x3u
+#define RADIO_SURVEY_PROFILE_AGGREGATOR_BIT 0x4u
+
 #define FEM_USE_DEFAULT_TX_POWER_CONTROL 0xFF
 
 /**@brief Radio transmit and address pattern. */
@@ -216,6 +219,12 @@ enum radio_proto_role {
 	RADIO_PROTO_ROLE_RX,
 };
 
+enum radio_survey_node_type {
+	RADIO_SURVEY_NODE_TYPE_UNKNOWN = 0,
+	RADIO_SURVEY_NODE_TYPE_X = 1,
+	RADIO_SURVEY_NODE_TYPE_Y = 2,
+};
+
 enum radio_proto_cmd {
 	RADIO_PROTO_CMD_DISCOVER_REQ = 1,
 	RADIO_PROTO_CMD_DISCOVER_RSP,
@@ -227,8 +236,11 @@ enum radio_proto_cmd {
 	RADIO_PROTO_CMD_RELEASE_REQ,
 	RADIO_PROTO_CMD_RELEASE_RSP,
 	RADIO_PROTO_CMD_REMOTE_TEST_REQ,
+	RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
 	RADIO_PROTO_CMD_REMOTE_TEST_REPORT,
 	RADIO_PROTO_CMD_REMOTE_TEST_DONE,
+	RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK,
+	RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK,
 	RADIO_PROTO_CMD_PROVISION_REQ,
 	RADIO_PROTO_CMD_PROVISION_RSP,
 };
@@ -246,6 +258,8 @@ struct radio_proto_peer {
 	uint32_t signature;
 	uint32_t rx_test_packets;
 	uint16_t reported_rx_packets;
+	uint8_t node_type;
+	bool is_data_aggregator;
 	bool seen_discover_rsp;
 	bool seen_per_rsp;
 	bool seen_clear_per_rsp;
@@ -305,9 +319,16 @@ void toggle_dcdc_state(uint8_t dcdc_state);
 
 void radio_proto_set_signature(uint32_t signature);
 
+void radio_proto_set_local_node_profile(enum radio_survey_node_type node_type,
+					      bool is_data_aggregator);
+
 void radio_proto_set_role(enum radio_proto_role role);
 
 enum radio_proto_role radio_proto_get_role(void);
+
+enum radio_survey_node_type radio_proto_get_local_node_type(void);
+
+bool radio_proto_get_local_aggregator(void);
 
 void radio_proto_reset(void);
 
@@ -318,6 +339,9 @@ int radio_proto_prepare_tx_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
 
 void radio_proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature,
 				       uint16_t value);
+
+void radio_proto_schedule_response_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
+				       uint16_t value, uint32_t aux_signature);
 
 void radio_proto_get_status(struct radio_proto_status *status);
 

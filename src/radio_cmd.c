@@ -120,7 +120,7 @@ static struct radio_proto_cli_config proto_cfg = {
 #define RADIO_NODE_SETTINGS_NAME "radio_node"
 #define RADIO_NODE_SETTINGS_KEY  RADIO_NODE_SETTINGS_NAME "/state"
 #define RADIO_NODE_SETTINGS_MAGIC 0x4E4F4445u
-#define RADIO_NODE_SETTINGS_VERSION 1u
+#define RADIO_NODE_SETTINGS_VERSION 2u
 
 struct radio_node_persist {
 	uint32_t magic;
@@ -128,6 +128,9 @@ struct radio_node_persist {
 	uint16_t mode;
 	uint32_t assigned_signature;
 	uint32_t next_receiver_id;
+	uint8_t node_type;
+	uint8_t is_data_aggregator;
+	uint16_t reserved0;
 };
 
 static struct radio_node_persist node_cfg = {
@@ -136,6 +139,9 @@ static struct radio_node_persist node_cfg = {
 	.mode = RADIO_NODE_MODE_UNASSIGNED,
 	.assigned_signature = 0u,
 	.next_receiver_id = 1u,
+	.node_type = RADIO_SURVEY_NODE_TYPE_X,
+	.is_data_aggregator = 0u,
+	.reserved0 = 0u,
 };
 
 static uint32_t node_hw_signature;
@@ -153,6 +159,15 @@ static struct k_work_delayable node_settings_save_work;
 static volatile bool proto_collect_per_cancel;
 
 #define NODE_RELEASE_APPLY_DELAY_MS 80
+#define NODE_SETTINGS_SAVE_DELAY_MS 300
+#define REMOTE_TEST_REPORT_RETRY_MAX 5
+#define REMOTE_TEST_DONE_RETRY_MAX 5
+#define REMOTE_TEST_DELEGATE_TIMEOUT_MIN_MS 4000u
+#define PRETEST_CLEAR_RETRY_MAX 3u
+#define REMOTE_TEST_REQ_RETRY_MAX 3u
+#define REMOTE_TEST_REQ_ACK_WAIT_MIN_MS 120u
+#define REMOTE_TEST_DISCOVER_ROUNDS 2u
+#define PROTO_PER_PHASE_MAX_ROUNDS 6u
 
 #define REMOTE_TEST_WORKQ_STACK_SIZE 4096
 K_THREAD_STACK_DEFINE(remote_test_workq_stack, REMOTE_TEST_WORKQ_STACK_SIZE);
@@ -173,10 +188,33 @@ struct remote_test_monitor_state {
 	volatile uint32_t delegate_signature;
 	volatile uint16_t expected_packets;
 	volatile uint16_t reported_peers;
+	volatile uint32_t last_activity_ticks;
+	uint32_t reported_peer_sigs[RADIO_PROTO_MAX_PEERS];
+	uint8_t reported_peer_count;
 };
 
 static struct remote_test_request_state remote_test_request;
 static struct remote_test_monitor_state remote_test_monitor;
+static volatile bool remote_test_req_ack_received;
+static volatile uint16_t remote_test_req_ack_packets;
+static volatile bool remote_test_report_ack_received;
+static volatile uint32_t remote_test_report_ack_peer;
+static volatile uint16_t remote_test_report_ack_value;
+static volatile bool remote_test_done_ack_received;
+static volatile uint16_t remote_test_done_ack_reports;
+
+void radio_node_note_proto_frame_activity(uint32_t src_signature)
+{
+	if (!remote_test_monitor.active) {
+		return;
+	}
+
+	if (src_signature != remote_test_monitor.delegate_signature) {
+		return;
+	}
+
+	remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
+}
 static bool proto_minimal_logging = true;
 
 static K_SEM_DEFINE(proto_tx_done_sem, 0, 1);
@@ -278,6 +316,50 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 				 uint32_t wait_ms, uint32_t retry_ms);
 static int proto_round_robin_run_internal(const struct shell *shell, uint32_t packets,
 					   uint32_t wait_ms, uint32_t retry_ms);
+static const char *node_mode_str(enum radio_node_mode mode);
+
+static bool node_is_type_valid(uint8_t node_type)
+{
+	return node_type == RADIO_SURVEY_NODE_TYPE_X ||
+	       node_type == RADIO_SURVEY_NODE_TYPE_Y;
+}
+
+static const char *node_type_str(uint8_t node_type)
+{
+	switch (node_type) {
+	case RADIO_SURVEY_NODE_TYPE_X:
+		return "x";
+	case RADIO_SURVEY_NODE_TYPE_Y:
+		return "y";
+	default:
+		return "unknown";
+	}
+}
+
+static bool node_peer_eligible_for_per(const struct radio_proto_peer *peer)
+{
+	if (peer == NULL) {
+		return false;
+	}
+
+	if (!node_is_type_valid(node_cfg.node_type) || !node_is_type_valid(peer->node_type)) {
+		return false;
+	}
+
+	if (node_cfg.node_type == RADIO_SURVEY_NODE_TYPE_Y) {
+		/* Y nodes only run PER against X nodes. */
+		return peer->node_type == RADIO_SURVEY_NODE_TYPE_X;
+	}
+
+	/* X nodes run PER against both X and Y nodes. */
+	return true;
+}
+
+static void node_apply_local_profile_to_proto(void)
+{
+	radio_proto_set_local_node_profile((enum radio_survey_node_type)node_cfg.node_type,
+					  node_cfg.is_data_aggregator != 0u);
+}
 
 static void proto_ack_start(const struct shell *shell, const char *command)
 {
@@ -297,16 +379,13 @@ static void proto_ack_end(const struct shell *shell, const char *command, int er
 	}
 }
 
-static void proto_emit_per_report(uint32_t dst_signature, uint32_t src_signature,
+static void proto_emit_per_report(uint32_t rx_signature, uint32_t tx_signature,
 				  uint16_t sent_packets, uint16_t recv_packets)
 {
-	int64_t t_ms = k_uptime_get();
-
-	/* PER_REPORT,<time_ms>,<dst_id>,<src_id>,<sent_packets>,<received_packets> */
-	printk("PER_REPORT,%lld,0x%08x,0x%08x,%u,%u\n",
-	       (long long)t_ms,
-	       dst_signature,
-	       src_signature,
+	/* PER_REPORT,<tx_serial>,<rx_serial>,<total_sent>,<total_received> */
+	printk("PER_REPORT,0x%08x,0x%08x,%u,%u\n",
+	       tx_signature,
+	       rx_signature,
 	       (unsigned int)sent_packets,
 	       (unsigned int)recv_packets);
 }
@@ -314,6 +393,32 @@ static void proto_emit_per_report(uint32_t dst_signature, uint32_t src_signature
 static bool proto_verbose_logging_enabled(void)
 {
 	return !proto_minimal_logging;
+}
+
+static bool remote_test_monitor_mark_peer_reported(uint32_t peer_signature)
+{
+	for (uint8_t i = 0; i < remote_test_monitor.reported_peer_count; i++) {
+		if (remote_test_monitor.reported_peer_sigs[i] == peer_signature) {
+			return false;
+		}
+	}
+
+	if (remote_test_monitor.reported_peer_count < ARRAY_SIZE(remote_test_monitor.reported_peer_sigs)) {
+		remote_test_monitor.reported_peer_sigs[remote_test_monitor.reported_peer_count++] = peer_signature;
+	}
+
+	return true;
+}
+
+static bool remote_test_monitor_has_peer_report(uint32_t peer_signature)
+{
+	for (uint8_t i = 0; i < remote_test_monitor.reported_peer_count; i++) {
+		if (remote_test_monitor.reported_peer_sigs[i] == peer_signature) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 static void node_release_work_handler(struct k_work *work)
@@ -358,6 +463,7 @@ static void node_apply_mode(enum radio_node_mode mode)
 	}
 
 	radio_proto_set_signature(proto_cfg.signature);
+	node_apply_local_profile_to_proto();
 	node_stop_radio_activity();
 
 	switch (mode) {
@@ -403,7 +509,8 @@ static void node_apply_receiver_work_handler(struct k_work *work)
 		node_pending_discover_rsp_dst = 0u;
 	}
 
-	k_work_reschedule(&node_settings_save_work, K_NO_WAIT);
+	/* Keep first DISCOVER_RSP prompt; defer flash write to avoid delaying response work. */
+	k_work_reschedule(&node_settings_save_work, K_MSEC(NODE_SETTINGS_SAVE_DELAY_MS));
 	printk("Provisioned as receiver ID 0x%08x\n", node_cfg.assigned_signature);
 }
 
@@ -1689,6 +1796,9 @@ int radio_node_init(void)
 			node_cfg.mode = RADIO_NODE_MODE_UNASSIGNED;
 			node_cfg.assigned_signature = 0u;
 			node_cfg.next_receiver_id = 1u;
+			node_cfg.node_type = RADIO_SURVEY_NODE_TYPE_X;
+			node_cfg.is_data_aggregator = 0u;
+			node_cfg.reserved0 = 0u;
 		}
 	} else {
 		node_cfg.magic = RADIO_NODE_SETTINGS_MAGIC;
@@ -1696,6 +1806,13 @@ int radio_node_init(void)
 		node_cfg.mode = RADIO_NODE_MODE_UNASSIGNED;
 		node_cfg.assigned_signature = 0u;
 		node_cfg.next_receiver_id = 1u;
+		node_cfg.node_type = RADIO_SURVEY_NODE_TYPE_X;
+		node_cfg.is_data_aggregator = 0u;
+		node_cfg.reserved0 = 0u;
+	}
+
+	if (!node_is_type_valid(node_cfg.node_type)) {
+		node_cfg.node_type = RADIO_SURVEY_NODE_TYPE_X;
 	}
 
 	k_work_init(&node_button_work, node_button_work_handler);
@@ -1737,6 +1854,11 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	    node_cfg.mode != RADIO_NODE_MODE_COORDINATOR &&
 	    node_cfg.mode != RADIO_NODE_MODE_TEST_TX &&
 	    frame->dst_signature == proto_cfg.signature) {
+		if (proto_verbose_logging_enabled()) {
+			printk("Received RELEASE_REQ from 0x%08x (mode=%s), sending RELEASE_RSP\n",
+			       frame->src_signature,
+			       node_mode_str((enum radio_node_mode)node_cfg.mode));
+		}
 		radio_proto_schedule_response(RADIO_PROTO_CMD_RELEASE_RSP,
 					     frame->src_signature,
 					     0u);
@@ -1744,13 +1866,26 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 		return;
 	}
 
+	if (frame->cmd == RADIO_PROTO_CMD_RELEASE_REQ &&
+	    proto_verbose_logging_enabled()) {
+		printk("Ignored RELEASE_REQ from 0x%08x: mode=%s dst=0x%08x local=0x%08x\n",
+		       frame->src_signature,
+		       node_mode_str((enum radio_node_mode)node_cfg.mode),
+		       frame->dst_signature,
+		       proto_cfg.signature);
+	}
+
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REQ &&
 	    node_cfg.mode != RADIO_NODE_MODE_COORDINATOR &&
 	    node_cfg.mode != RADIO_NODE_MODE_TEST_TX &&
 	    frame->dst_signature == proto_cfg.signature) {
 		if (remote_test_request.busy || remote_test_request.pending) {
+			radio_proto_schedule_response(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
+					     frame->src_signature,
+					     frame->value);
 			if (proto_verbose_logging_enabled()) {
-				printk("Remote test request ignored while busy\n");
+				printk("Remote test request already active; acked duplicate from 0x%08x\n",
+				       frame->src_signature);
 			}
 			return;
 		}
@@ -1766,6 +1901,9 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 			remote_test_request.retry_ms = remote_test_request.wait_ms;
 		}
 		remote_test_request.pending = true;
+		radio_proto_schedule_response(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
+					     frame->src_signature,
+					     frame->value);
 		k_work_submit_to_queue(&remote_test_workq, &remote_test_work);
 		if (proto_verbose_logging_enabled()) {
 			printk("Remote test request accepted from 0x%08x\n", frame->src_signature);
@@ -1773,15 +1911,32 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 		return;
 	}
 
+	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK &&
+	    frame->dst_signature == proto_cfg.signature &&
+	    remote_test_monitor.active &&
+	    frame->src_signature == remote_test_monitor.delegate_signature) {
+		remote_test_req_ack_packets = frame->value;
+		remote_test_req_ack_received = true;
+		return;
+	}
+
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REPORT &&
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_monitor.active &&
 	    frame->src_signature == remote_test_monitor.delegate_signature) {
-		remote_test_monitor.reported_peers++;
-		proto_emit_per_report(frame->aux_signature,
-				      frame->src_signature,
-				      remote_test_monitor.expected_packets,
-				      frame->value);
+		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
+		if (remote_test_monitor_mark_peer_reported(frame->aux_signature)) {
+			remote_test_monitor.reported_peers++;
+			proto_emit_per_report(frame->aux_signature,
+					      frame->src_signature,
+					      remote_test_monitor.expected_packets,
+					      frame->value);
+		}
+
+		radio_proto_schedule_response_ext(RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK,
+						 frame->src_signature,
+						 frame->value,
+						 frame->aux_signature);
 		return;
 	}
 
@@ -1789,13 +1944,36 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_monitor.active &&
 	    frame->src_signature == remote_test_monitor.delegate_signature) {
-		remote_test_monitor.reported_peers = frame->value;
+		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
+		remote_test_monitor.reported_peers = remote_test_monitor.reported_peer_count;
 		remote_test_monitor.done = true;
+		radio_proto_schedule_response(RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK,
+					     frame->src_signature,
+					     remote_test_monitor.reported_peers);
 		if (proto_verbose_logging_enabled()) {
 			printk("Remote test finished: delegate=0x%08x reports=%u\n",
 			       frame->src_signature,
-			       frame->value);
+			       remote_test_monitor.reported_peers);
 		}
+		return;
+	}
+
+	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK &&
+	    frame->dst_signature == proto_cfg.signature &&
+	    remote_test_request.busy &&
+	    frame->src_signature == remote_test_request.controller_signature) {
+		remote_test_report_ack_peer = frame->aux_signature;
+		remote_test_report_ack_value = frame->value;
+		remote_test_report_ack_received = true;
+		return;
+	}
+
+	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK &&
+	    frame->dst_signature == proto_cfg.signature &&
+	    remote_test_request.busy &&
+	    frame->src_signature == remote_test_request.controller_signature) {
+		remote_test_done_ack_reports = frame->value;
+		remote_test_done_ack_received = true;
 		return;
 	}
 
@@ -1918,9 +2096,11 @@ static int cmd_proto_status(const struct shell *shell, size_t argc, char **argv)
 	radio_proto_get_status(&status);
 
 	shell_print(shell,
-		"proto role=%u sig=0x%08x discover_req=%u discover_rsp=%u test_data=%u per_req=%u per_rsp=%u local_test_rx=%u peers=%u",
+		"proto role=%u sig=0x%08x local_type=%s local_agg=%u discover_req=%u discover_rsp=%u test_data=%u per_req=%u per_rsp=%u local_test_rx=%u peers=%u",
 		status.role,
 		status.local_signature,
+		node_type_str((uint8_t)radio_proto_get_local_node_type()),
+		radio_proto_get_local_aggregator() ? 1u : 0u,
 		status.discover_req_seen,
 		status.discover_rsp_seen,
 		status.test_data_seen,
@@ -1933,9 +2113,11 @@ static int cmd_proto_status(const struct shell *shell, size_t argc, char **argv)
 		const struct radio_proto_peer *peer = &status.peers[i];
 
 		shell_print(shell,
-			"peer[%u] sig=0x%08x discover=%u per=%u clear=%u release=%u reported_rx=%u",
+			"peer[%u] sig=0x%08x type=%s agg=%u discover=%u per=%u clear=%u release=%u reported_rx=%u",
 			i,
 			peer->signature,
+			node_type_str(peer->node_type),
+			peer->is_data_aggregator ? 1u : 0u,
 			peer->seen_discover_rsp,
 			peer->seen_per_rsp,
 			peer->seen_clear_per_rsp,
@@ -2025,6 +2207,8 @@ static int cmd_discover_list_clear(const struct shell *shell, size_t argc, char 
 	enum radio_node_mode prev_mode = (enum radio_node_mode)node_cfg.mode;
 	enum radio_proto_role prev_role = proto_cfg.role;
 	bool all_released = false;
+	uint8_t max_release_iterations = 10;
+	uint8_t release_iteration = 0;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -2036,7 +2220,14 @@ static int cmd_discover_list_clear(const struct shell *shell, size_t argc, char 
 	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 	proto_cfg.role = RADIO_PROTO_ROLE_TX;
 
-	while (!proto_release_cancel && !all_released && peer_count > 0) {
+	while (!proto_release_cancel && !all_released && peer_count > 0 && release_iteration < max_release_iterations) {
+		release_iteration++;
+		if (proto_verbose_logging_enabled()) {
+			shell_print(shell,
+				   "Release pass %u/%u",
+				   release_iteration,
+				   max_release_iterations);
+		}
 		all_released = true;
 		radio_proto_get_status(&status);
 
@@ -2083,6 +2274,24 @@ static int cmd_discover_list_clear(const struct shell *shell, size_t argc, char 
 					break;
 				}
 			}
+
+			if (proto_verbose_logging_enabled()) {
+				bool seen_release_rsp = false;
+
+				for (uint8_t p = 0; p < status.peer_count; p++) {
+					if (status.peers[p].signature == peer_sigs[i] &&
+					    status.peers[p].seen_release_rsp) {
+						seen_release_rsp = true;
+						break;
+					}
+				}
+
+				if (!seen_release_rsp) {
+					shell_print(shell,
+						   "No RELEASE_RSP yet from 0x%08x",
+						   peer_sigs[i]);
+				}
+			}
 		}
 
 		if (!all_released && !proto_release_cancel) {
@@ -2106,6 +2315,8 @@ static int cmd_discover_list_clear(const struct shell *shell, size_t argc, char 
 			shell_print(shell, "Peer release cancelled; discovered peer list cleared");
 		} else if (all_released) {
 			shell_print(shell, "Discovered peer list cleared and peers returned to unassigned");
+		} else if (release_iteration >= max_release_iterations) {
+			shell_print(shell, "Release timeout; discovered peer list cleared");
 		} else {
 			shell_print(shell, "Discovered peer list cleared");
 		}
@@ -2125,9 +2336,14 @@ static int cmd_discover_status(const struct shell *shell, size_t argc, char **ar
 	proto_ack_start(shell, "discover_status");
 
 	radio_proto_get_status(&status);
-	shell_print(shell, "DISCOVER_STATUS,index,signature");
+	shell_print(shell, "DISCOVER_STATUS,index,signature,node_type,is_aggregator");
 	for (uint8_t i = 0; i < status.peer_count; i++) {
-		shell_print(shell, "DISCOVER_STATUS,%u,0x%08x", i, status.peers[i].signature);
+		shell_print(shell,
+			"DISCOVER_STATUS,%u,0x%08x,%s,%u",
+			i,
+			status.peers[i].signature,
+			node_type_str(status.peers[i].node_type),
+			status.peers[i].is_data_aggregator ? 1u : 0u);
 	}
 
 	proto_ack_end(shell, "discover_status", 0);
@@ -2225,9 +2441,13 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 				 uint32_t wait_ms, uint32_t retry_ms)
 {
 	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
-	uint8_t peer_count;
+	uint32_t clear_peer_sigs[RADIO_PROTO_MAX_PEERS];
+	uint8_t peer_count = 0u;
+	uint8_t clear_peer_count = 0u;
 	bool all_per_done = false;
 	bool all_clear_done = false;
+	uint8_t per_rounds = 0u;
+	uint8_t clear_rounds = 0u;
 	struct radio_proto_status status;
 
 	if (expected == 0 || expected > UINT16_MAX) {
@@ -2237,12 +2457,42 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 		return -EINVAL;
 	}
 
-	peer_count = radio_proto_get_peer_signatures(peer_sigs, ARRAY_SIZE(peer_sigs));
-	if (peer_count == 0) {
+	radio_proto_get_status(&status);
+	for (uint8_t i = 0; i < status.peer_count; i++) {
+		const struct radio_proto_peer *peer = &status.peers[i];
+
+		if (clear_peer_count < ARRAY_SIZE(clear_peer_sigs)) {
+			clear_peer_sigs[clear_peer_count++] = peer->signature;
+		}
+
+		if (peer_count < ARRAY_SIZE(peer_sigs) && node_peer_eligible_for_per(peer)) {
+			peer_sigs[peer_count++] = peer->signature;
+			continue;
+		}
+
+		if (proto_verbose_logging_enabled() && shell != NULL) {
+			shell_print(shell,
+				"Skipping peer 0x%08x (local_type=%s peer_type=%s)",
+				peer->signature,
+				node_type_str(node_cfg.node_type),
+				node_type_str(peer->node_type));
+		}
+	}
+
+	if (peer_count == 0 && clear_peer_count == 0) {
 		if (shell != NULL) {
 			shell_print(shell, "No discovered peers in current list");
 		}
 		return 0;
+	}
+
+	if (peer_count == 0) {
+		all_per_done = true;
+		if (shell != NULL && proto_verbose_logging_enabled()) {
+			shell_print(shell,
+				   "No eligible discovered peers for local node type %s; clearing counters on all peers",
+				   node_type_str(node_cfg.node_type));
+		}
 	}
 
 	proto_collect_per_cancel = false;
@@ -2252,7 +2502,8 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 	proto_cfg.role = RADIO_PROTO_ROLE_TX;
 
-	while (!proto_collect_per_cancel && !all_per_done) {
+	while (!proto_collect_per_cancel && !all_per_done && per_rounds < PROTO_PER_PHASE_MAX_ROUNDS) {
+		per_rounds++;
 		all_per_done = true;
 		radio_proto_get_status(&status);
 
@@ -2312,15 +2563,16 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 		}
 	}
 
-	while (!proto_collect_per_cancel && all_per_done && !all_clear_done) {
+	while (!proto_collect_per_cancel && !all_clear_done && clear_rounds < PROTO_PER_PHASE_MAX_ROUNDS) {
+		clear_rounds++;
 		all_clear_done = true;
 		radio_proto_get_status(&status);
 
-		for (uint8_t i = 0; i < peer_count; i++) {
+		for (uint8_t i = 0; i < clear_peer_count; i++) {
 			bool already_cleared = false;
 
 			for (uint8_t p = 0; p < status.peer_count; p++) {
-				if (status.peers[p].signature == peer_sigs[i] &&
+				if (status.peers[p].signature == clear_peer_sigs[i] &&
 				    status.peers[p].seen_clear_per_rsp) {
 					already_cleared = true;
 					break;
@@ -2333,12 +2585,12 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 
 			all_clear_done = false;
 			if (proto_verbose_logging_enabled() && shell != NULL) {
-				shell_print(shell, "Request PER clear from 0x%08x", peer_sigs[i]);
+				shell_print(shell, "Request PER clear from 0x%08x", clear_peer_sigs[i]);
 			}
 
 			if (proto_send_frame(shell,
 				    RADIO_PROTO_CMD_CLEAR_PER_REQ,
-				    peer_sigs[i],
+				    clear_peer_sigs[i],
 				    0,
 				    1) != 0) {
 				continue;
@@ -2349,12 +2601,12 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 			radio_proto_get_status(&status);
 
 			for (uint8_t p = 0; p < status.peer_count; p++) {
-				if (status.peers[p].signature == peer_sigs[i] &&
+				if (status.peers[p].signature == clear_peer_sigs[i] &&
 				    status.peers[p].seen_clear_per_rsp) {
 					if (proto_verbose_logging_enabled() && shell != NULL) {
 						shell_print(shell,
 							"PER clear confirmed by 0x%08x",
-							peer_sigs[i]);
+							clear_peer_sigs[i]);
 					}
 					break;
 				}
@@ -2370,9 +2622,11 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 		if (proto_collect_per_cancel) {
 			shell_print(shell, "PER collection or clear confirmation cancelled");
 		} else if (!all_per_done) {
-			shell_print(shell, "PER collection stopped before all peers reported");
+			shell_print(shell,
+				   "PER collection stopped before all peers reported (round limit reached)");
 		} else if (!all_clear_done) {
-			shell_print(shell, "PER clear confirmation stopped before all peers acknowledged");
+			shell_print(shell,
+				   "PER clear confirmation stopped before all peers acknowledged (round limit reached)");
 		} else {
 			shell_print(shell, "All discovered peers reported PER and confirmed clear");
 		}
@@ -2399,6 +2653,22 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 	node_apply_mode(RADIO_NODE_MODE_COORDINATOR);
 
 	for (uint8_t i = 0; i < peer_count; i++) {
+		/* Delegate is silent while it performs discovery/PER/CLEAR phases.
+		 * Scale inactivity timeout with wait/retry parameters and keep a generous floor. */
+		uint32_t inactivity_timeout_ms = ((wait_ms + retry_ms) * 24u) + 5000u;
+		uint32_t activity_mark;
+		uint32_t last_inactivity_ms = 0u;
+		uint16_t synthesized_reports = 0u;
+		bool timed_out = false;
+		const char *ack_reason = "explicit";
+		bool req_acked = false;
+		uint32_t req_ack_wait_ms = wait_ms > REMOTE_TEST_REQ_ACK_WAIT_MIN_MS ?
+			wait_ms : REMOTE_TEST_REQ_ACK_WAIT_MIN_MS;
+
+		if (inactivity_timeout_ms < 60000u) {
+			inactivity_timeout_ms = 60000u;
+		}
+
 		if (proto_remote_test_cancel) {
 			break;
 		}
@@ -2408,26 +2678,134 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 		remote_test_monitor.delegate_signature = peer_sigs[i];
 		remote_test_monitor.expected_packets = (uint16_t)packets;
 		remote_test_monitor.reported_peers = 0u;
+		remote_test_monitor.reported_peer_count = 0u;
+		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
+		activity_mark = remote_test_monitor.last_activity_ticks;
+		memset(remote_test_monitor.reported_peer_sigs, 0, sizeof(remote_test_monitor.reported_peer_sigs));
+		if (shell != NULL) {
+			shell_print(shell,
+				   "RR_DIAG,start,delegate=0x%08x,packets=%u,wait=%u,retry=%u,inactivity_to=%u",
+				   peer_sigs[i],
+				   (unsigned int)packets,
+				   (unsigned int)wait_ms,
+				   (unsigned int)retry_ms,
+				   (unsigned int)inactivity_timeout_ms);
+		}
 		if (proto_verbose_logging_enabled()) {
 			shell_print(shell, "Round-robin: request remote test from 0x%08x", peer_sigs[i]);
 		}
-		radio_proto_set_role(RADIO_PROTO_ROLE_TX);
-		proto_cfg.role = RADIO_PROTO_ROLE_TX;
+		for (uint8_t attempt = 0; attempt < REMOTE_TEST_REQ_RETRY_MAX && !req_acked; attempt++) {
+			uint32_t req_wait_start;
 
-		if (proto_send_frame_ex(shell,
-				    RADIO_PROTO_CMD_REMOTE_TEST_REQ,
-				    peer_sigs[i],
-				    (uint16_t)packets,
-				    proto_pack_u16_pair((uint16_t)wait_ms, (uint16_t)retry_ms),
-				    1u) != 0) {
-			remote_test_monitor.active = false;
+			remote_test_req_ack_received = false;
+			remote_test_req_ack_packets = 0u;
+
+			radio_proto_set_role(RADIO_PROTO_ROLE_TX);
+			proto_cfg.role = RADIO_PROTO_ROLE_TX;
+
+			if (proto_send_frame_ex(shell,
+					    RADIO_PROTO_CMD_REMOTE_TEST_REQ,
+					    peer_sigs[i],
+					    (uint16_t)packets,
+					    proto_pack_u16_pair((uint16_t)wait_ms, (uint16_t)retry_ms),
+					    1u) != 0) {
+				node_apply_mode(RADIO_NODE_MODE_COORDINATOR);
+				continue;
+			}
+
 			node_apply_mode(RADIO_NODE_MODE_COORDINATOR);
+
+			req_wait_start = (uint32_t)k_uptime_get_32();
+			while (!proto_remote_test_cancel &&
+			       !remote_test_req_ack_received &&
+			       (uint32_t)(k_uptime_get_32() - req_wait_start) < req_ack_wait_ms) {
+				k_msleep(20);
+			}
+
+			if (remote_test_req_ack_received &&
+			    remote_test_req_ack_packets == (uint16_t)packets) {
+				req_acked = true;
+			}
+		}
+
+		if (!req_acked) {
+			if (remote_test_monitor.last_activity_ticks != activity_mark) {
+				req_acked = true;
+				ack_reason = "activity";
+				if (proto_verbose_logging_enabled()) {
+					shell_print(shell,
+					   "Round-robin: inferred REMOTE_TEST_REQ acceptance from activity 0x%08x",
+					   peer_sigs[i]);
+				}
+			}
+		}
+
+		if (shell != NULL) {
+			shell_print(shell,
+				   "RR_DIAG,req,delegate=0x%08x,acked=%u,reason=%s,ack_packets=%u",
+				   peer_sigs[i],
+				   req_acked ? 1u : 0u,
+				   ack_reason,
+				   (unsigned int)remote_test_req_ack_packets);
+		}
+
+		if (!req_acked) {
+			ack_reason = "none";
+			if (proto_verbose_logging_enabled()) {
+				shell_print(shell,
+					   "Round-robin: no REMOTE_TEST_REQ_ACK from 0x%08x",
+					   peer_sigs[i]);
+			}
+
+			/* Keep output matrix complete even if delegate never acknowledged request. */
+			for (uint8_t r = 0; r < peer_count; r++) {
+				uint32_t rx_sig = peer_sigs[r];
+
+				if (rx_sig == peer_sigs[i]) {
+					continue;
+				}
+
+				if (remote_test_monitor_has_peer_report(rx_sig)) {
+					continue;
+				}
+
+				proto_emit_per_report(rx_sig, peer_sigs[i], (uint16_t)packets, 0u);
+				(void)remote_test_monitor_mark_peer_reported(rx_sig);
+				remote_test_monitor.reported_peers++;
+				synthesized_reports++;
+			}
+
+			if (shell != NULL) {
+				shell_print(shell,
+				   "RR_DIAG,end,delegate=0x%08x,done=%u,timed_out=%u,reason=%s,reports=%u,synth=%u,last_inactive=%u",
+				   peer_sigs[i],
+				   0u,
+				   0u,
+				   ack_reason,
+				   (unsigned int)remote_test_monitor.reported_peers,
+				   (unsigned int)synthesized_reports,
+				   (unsigned int)last_inactivity_ms);
+			}
+
+			remote_test_monitor.active = false;
 			continue;
 		}
 
-		node_apply_mode(RADIO_NODE_MODE_COORDINATOR);
-
 		while (!proto_remote_test_cancel && !remote_test_monitor.done) {
+			uint32_t now_ticks = (uint32_t)k_uptime_get_32();
+			uint32_t inactivity_ms = now_ticks - remote_test_monitor.last_activity_ticks;
+			last_inactivity_ms = inactivity_ms;
+
+			if (inactivity_ms > inactivity_timeout_ms) {
+				timed_out = true;
+				if (proto_verbose_logging_enabled()) {
+					shell_print(shell,
+						   "Round-robin: delegate 0x%08x timed out (inactive %ums)",
+						   peer_sigs[i],
+						   inactivity_ms);
+				}
+				break;
+			}
 			k_msleep(20);
 		}
 
@@ -2438,13 +2816,54 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 			break;
 		}
 
+		for (uint8_t r = 0; r < peer_count; r++) {
+			uint32_t rx_sig = peer_sigs[r];
+
+			if (rx_sig == peer_sigs[i]) {
+				continue;
+			}
+
+			if (remote_test_monitor_has_peer_report(rx_sig)) {
+				continue;
+			}
+
+			/* Keep output matrix complete even when delegate misses a peer. */
+			proto_emit_per_report(rx_sig, peer_sigs[i], (uint16_t)packets, 0u);
+			(void)remote_test_monitor_mark_peer_reported(rx_sig);
+			remote_test_monitor.reported_peers++;
+			synthesized_reports++;
+
+			if (proto_verbose_logging_enabled()) {
+				shell_print(shell,
+					   "Round-robin: synthesized missing report tx=0x%08x rx=0x%08x",
+					   peer_sigs[i],
+					   rx_sig);
+			}
+		}
+
 		if (proto_verbose_logging_enabled()) {
 			shell_print(shell,
 				"Round-robin: delegate 0x%08x complete, reports=%u",
 				peer_sigs[i],
 				remote_test_monitor.reported_peers);
 		}
+		if (shell != NULL) {
+			shell_print(shell,
+				   "RR_DIAG,end,delegate=0x%08x,done=%u,timed_out=%u,reason=%s,reports=%u,synth=%u,last_inactive=%u",
+				   peer_sigs[i],
+				   remote_test_monitor.done ? 1u : 0u,
+				   timed_out ? 1u : 0u,
+				   ack_reason,
+				   (unsigned int)remote_test_monitor.reported_peers,
+				   (unsigned int)synthesized_reports,
+				   (unsigned int)last_inactivity_ms);
+		}
 		remote_test_monitor.active = false;
+
+		/* Allow the finished delegate time to restore RX mode before next delegate discovers. */
+		if ((i + 1u) < peer_count) {
+			k_msleep(wait_ms);
+		}
 	}
 
 	remote_test_monitor.active = false;
@@ -2452,6 +2871,126 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 	proto_remote_test_cancel = false;
 	node_apply_mode(prev_mode);
 	return 0;
+}
+
+static bool remote_test_send_report_with_retry(uint32_t controller_signature,
+					       uint32_t peer_signature,
+					       uint16_t reported_rx_packets,
+					       uint16_t retry_ms)
+{
+	for (uint8_t attempt = 0; attempt < REMOTE_TEST_REPORT_RETRY_MAX; attempt++) {
+		remote_test_report_ack_received = false;
+		remote_test_report_ack_peer = 0u;
+		remote_test_report_ack_value = 0u;
+
+		if (proto_send_frame_ex(NULL,
+				    RADIO_PROTO_CMD_REMOTE_TEST_REPORT,
+				    controller_signature,
+				    reported_rx_packets,
+				    peer_signature,
+				    1u) != 0) {
+			continue;
+		}
+
+		k_msleep(2);
+		proto_rx_window(retry_ms);
+
+		if (remote_test_report_ack_received &&
+		    remote_test_report_ack_peer == peer_signature &&
+		    remote_test_report_ack_value == reported_rx_packets) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool remote_test_send_done_with_retry(uint32_t controller_signature,
+				     uint16_t reported_peers,
+				     uint16_t retry_ms)
+{
+	for (uint8_t attempt = 0; attempt < REMOTE_TEST_DONE_RETRY_MAX; attempt++) {
+		remote_test_done_ack_received = false;
+		remote_test_done_ack_reports = 0u;
+
+		if (proto_send_frame_ex(NULL,
+				    RADIO_PROTO_CMD_REMOTE_TEST_DONE,
+				    controller_signature,
+				    reported_peers,
+				    0u,
+				    1u) != 0) {
+			continue;
+		}
+
+		k_msleep(2);
+		proto_rx_window(retry_ms);
+
+		if (remote_test_done_ack_received &&
+		    remote_test_done_ack_reports == reported_peers) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void proto_clear_counters_before_test(const struct shell *shell,
+					      uint32_t wait_ms,
+					      uint32_t retry_ms)
+{
+	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
+	uint8_t peer_count = radio_proto_get_peer_signatures(peer_sigs, ARRAY_SIZE(peer_sigs));
+	struct radio_proto_status status;
+
+	if (peer_count == 0u) {
+		return;
+	}
+
+	radio_proto_reset_clear_per_results();
+	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
+	proto_cfg.role = RADIO_PROTO_ROLE_TX;
+
+	for (uint8_t i = 0; i < peer_count; i++) {
+		bool cleared = false;
+
+		for (uint8_t attempt = 0; attempt < PRETEST_CLEAR_RETRY_MAX; attempt++) {
+			if (proto_send_frame(shell,
+				    RADIO_PROTO_CMD_CLEAR_PER_REQ,
+				    peer_sigs[i],
+				    0u,
+				    1u) != 0) {
+				continue;
+			}
+
+			k_msleep(2);
+			proto_rx_window(wait_ms);
+			radio_proto_get_status(&status);
+
+			for (uint8_t p = 0; p < status.peer_count; p++) {
+				if (status.peers[p].signature == peer_sigs[i] &&
+				    status.peers[p].seen_clear_per_rsp) {
+					cleared = true;
+					break;
+				}
+			}
+
+			if (cleared) {
+				break;
+			}
+
+			k_msleep(retry_ms);
+		}
+
+		if (!cleared && proto_verbose_logging_enabled()) {
+			if (shell != NULL) {
+				shell_print(shell,
+					   "Pre-test clear not confirmed for 0x%08x",
+					   peer_sigs[i]);
+			} else {
+				printk("Pre-test clear not confirmed for 0x%08x\n", peer_sigs[i]);
+			}
+		}
+	}
 }
 
 static void remote_test_work_handler(struct k_work *work)
@@ -2472,6 +3011,11 @@ static void remote_test_work_handler(struct k_work *work)
 	request = remote_test_request;
 	remote_test_request.pending = false;
 	remote_test_request.busy = true;
+	remote_test_report_ack_received = false;
+	remote_test_report_ack_peer = 0u;
+	remote_test_report_ack_value = 0u;
+	remote_test_done_ack_received = false;
+	remote_test_done_ack_reports = 0u;
 	proto_remote_test_cancel = false;
 	prev_mode = (enum radio_node_mode)node_cfg.mode;
 
@@ -2482,6 +3026,11 @@ static void remote_test_work_handler(struct k_work *work)
 		       request.wait_ms,
 		       request.retry_ms);
 	}
+	printk("RTW_DIAG,start,controller=0x%08x,packets=%u,wait=%u,retry=%u\n",
+	       request.controller_signature,
+	       request.packets,
+	       request.wait_ms,
+	       request.retry_ms);
 
 	node_apply_mode(RADIO_NODE_MODE_TEST_TX);
 	radio_proto_reset();
@@ -2495,14 +3044,29 @@ static void remote_test_work_handler(struct k_work *work)
 			    0u,
 			    0u,
 			    1u) == 0) {
-		k_msleep(2);
-		proto_rx_window(proto_cfg.discover_window_ms);
+		for (uint8_t round = 0; round < REMOTE_TEST_DISCOVER_ROUNDS; round++) {
+			k_msleep(2);
+			proto_rx_window(proto_cfg.discover_window_ms);
+			if ((round + 1u) < REMOTE_TEST_DISCOVER_ROUNDS) {
+				(void)proto_send_frame_ex(NULL,
+						RADIO_PROTO_CMD_DISCOVER_REQ,
+						RADIO_PROTO_BROADCAST_SIG,
+						0u,
+						0u,
+						1u);
+			}
+		}
 	}
 
 	peer_count = radio_proto_get_peer_signatures(peer_sigs, ARRAY_SIZE(peer_sigs));
 	if (proto_verbose_logging_enabled()) {
 		printk("Remote test discover complete: %u peers\n", peer_count);
 	}
+	printk("RTW_DIAG,discover,controller=0x%08x,peers=%u\n",
+	       request.controller_signature,
+	       peer_count);
+
+	proto_clear_counters_before_test(NULL, request.wait_ms, request.retry_ms);
 
 	if (peer_count > 0 && request.packets > 0u &&
 	    proto_send_frame_ex(NULL,
@@ -2519,27 +3083,51 @@ static void remote_test_work_handler(struct k_work *work)
 
 	radio_proto_get_status(&status);
 	for (uint8_t i = 0; i < status.peer_count; i++) {
-		if (!status.peers[i].seen_per_rsp) {
+		uint16_t reported_rx_packets;
+
+		if (!node_peer_eligible_for_per(&status.peers[i])) {
 			continue;
 		}
 
-		if (proto_send_frame_ex(NULL,
-				    RADIO_PROTO_CMD_REMOTE_TEST_REPORT,
-				    request.controller_signature,
-				    status.peers[i].reported_rx_packets,
-				    status.peers[i].signature,
-				    1u) == 0) {
+		reported_rx_packets = status.peers[i].seen_per_rsp ?
+			status.peers[i].reported_rx_packets : 0u;
+
+		if (remote_test_send_report_with_retry(request.controller_signature,
+					      status.peers[i].signature,
+					      reported_rx_packets,
+					      request.retry_ms)) {
 			reported_peers++;
-			k_msleep(2);
+			printk("RTW_DIAG,report,controller=0x%08x,peer=0x%08x,rx=%u,ok=1\n",
+			       request.controller_signature,
+			       status.peers[i].signature,
+			       reported_rx_packets);
+		} else {
+			if (proto_verbose_logging_enabled()) {
+				printk("Remote test report delivery failed: peer=0x%08x rx=%u\n",
+				       status.peers[i].signature,
+				       reported_rx_packets);
+			}
+			printk("RTW_DIAG,report,controller=0x%08x,peer=0x%08x,rx=%u,ok=0\n",
+			       request.controller_signature,
+			       status.peers[i].signature,
+			       reported_rx_packets);
 		}
 	}
 
-	(void)proto_send_frame_ex(NULL,
-			    RADIO_PROTO_CMD_REMOTE_TEST_DONE,
-			    request.controller_signature,
-			    reported_peers,
-			    0u,
-			    1u);
+	if (!remote_test_send_done_with_retry(request.controller_signature,
+				      reported_peers,
+				      request.retry_ms)) {
+		if (proto_verbose_logging_enabled()) {
+			printk("Remote test done delivery failed: reports=%u\n", reported_peers);
+		}
+		printk("RTW_DIAG,done,controller=0x%08x,reports=%u,ok=0\n",
+		       request.controller_signature,
+		       reported_peers);
+	} else {
+		printk("RTW_DIAG,done,controller=0x%08x,reports=%u,ok=1\n",
+		       request.controller_signature,
+		       reported_peers);
+	}
 
 	radio_proto_reset();
 	node_apply_mode(prev_mode);
@@ -2707,6 +3295,7 @@ static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **arg
 
 	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 	proto_cfg.role = RADIO_PROTO_ROLE_TX;
+	proto_clear_counters_before_test(shell, wait_ms, retry_ms);
 
 	if (proto_send_frame(shell,
 		    RADIO_PROTO_CMD_TEST_DATA,
@@ -2749,7 +3338,8 @@ static int cmd_node_mode(const struct shell *shell, size_t argc, char **argv)
 	proto_ack_start(shell, "node_mode");
 
 	if (argc != 2) {
-		shell_error(shell, "Usage: node_mode <unassigned|coordinator|receiver|test_tx>");
+		shell_error(shell,
+			    "Usage: node_mode <unassigned|coordinator|receiver|test_tx> (set X/Y with node_type)");
 		err = -EINVAL;
 		goto out;
 	}
@@ -2785,6 +3375,70 @@ out:
 	return err;
 }
 
+static int cmd_node_type(const struct shell *shell, size_t argc, char **argv)
+{
+	int err = 0;
+
+	proto_ack_start(shell, "node_type");
+
+	if (argc != 2) {
+		shell_error(shell, "Usage: node_type <x|y>");
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (strcmp(argv[1], "x") == 0 || strcmp(argv[1], "X") == 0) {
+		node_cfg.node_type = RADIO_SURVEY_NODE_TYPE_X;
+	} else if (strcmp(argv[1], "y") == 0 || strcmp(argv[1], "Y") == 0) {
+		node_cfg.node_type = RADIO_SURVEY_NODE_TYPE_Y;
+	} else {
+		shell_error(shell, "Invalid node type: %s", argv[1]);
+		err = -EINVAL;
+		goto out;
+	}
+
+	node_apply_local_profile_to_proto();
+	k_work_reschedule(&node_settings_save_work, K_NO_WAIT);
+	shell_print(shell, "Node type set to %s", node_type_str(node_cfg.node_type));
+
+out:
+	proto_ack_end(shell, "node_type", err);
+	return err;
+}
+
+static int cmd_node_aggregator(const struct shell *shell, size_t argc, char **argv)
+{
+	int err = 0;
+
+	proto_ack_start(shell, "node_aggregator");
+
+	if (argc != 2) {
+		shell_error(shell, "Usage: node_aggregator <on|off>");
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "1") == 0) {
+		node_cfg.is_data_aggregator = 1u;
+	} else if (strcmp(argv[1], "off") == 0 || strcmp(argv[1], "0") == 0) {
+		node_cfg.is_data_aggregator = 0u;
+	} else {
+		shell_error(shell, "Invalid aggregator state: %s", argv[1]);
+		err = -EINVAL;
+		goto out;
+	}
+
+	node_apply_local_profile_to_proto();
+	k_work_reschedule(&node_settings_save_work, K_NO_WAIT);
+	shell_print(shell,
+		   "Data aggregator role %s",
+		   node_cfg.is_data_aggregator ? "enabled" : "disabled");
+
+out:
+	proto_ack_end(shell, "node_aggregator", err);
+	return err;
+}
+
 static int cmd_log_mode(const struct shell *shell, size_t argc, char **argv)
 {
 	int err = 0;
@@ -2817,8 +3471,10 @@ out:
 static int cmd_node_status(const struct shell *shell, size_t argc, char **argv)
 {
 	shell_print(shell,
-		"node mode=%s hw_sig=0x%08x active_sig=0x%08x assigned_sig=0x%08x next_rx_id=%u",
+		"node mode=%s type=%s aggregator=%u hw_sig=0x%08x active_sig=0x%08x assigned_sig=0x%08x next_rx_id=%u",
 		node_mode_str((enum radio_node_mode)node_cfg.mode),
+		node_type_str(node_cfg.node_type),
+		node_cfg.is_data_aggregator ? 1u : 0u,
 		node_hw_signature,
 		proto_cfg.signature,
 		node_cfg.assigned_signature,
@@ -3152,6 +3808,12 @@ SHELL_CMD_REGISTER(print_rx, NULL, "Print RX payload", cmd_print_payload);
 SHELL_CMD_REGISTER(node_mode, NULL,
 		   "Set node mode <unassigned|coordinator|receiver|test_tx>",
 		   cmd_node_mode);
+SHELL_CMD_REGISTER(node_type, NULL,
+		   "Set site-survey node type <x|y>",
+		   cmd_node_type);
+SHELL_CMD_REGISTER(node_aggregator, NULL,
+		   "Enable or disable data aggregator role <on|off>",
+		   cmd_node_aggregator);
 SHELL_CMD_REGISTER(node_status, NULL,
 		   "Print persisted node state and signatures",
 		   cmd_node_status);

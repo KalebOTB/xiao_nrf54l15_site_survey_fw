@@ -129,6 +129,8 @@ static volatile bool test_is_running;
 
 static enum radio_proto_role proto_role = RADIO_PROTO_ROLE_DISABLED;
 static uint32_t proto_local_signature;
+static enum radio_survey_node_type proto_local_node_type = RADIO_SURVEY_NODE_TYPE_X;
+static bool proto_local_is_aggregator;
 static uint8_t proto_seq;
 static uint32_t proto_discover_req_seen;
 static uint32_t proto_discover_rsp_seen;
@@ -147,6 +149,7 @@ static bool proto_rsp_pending;
 static enum radio_proto_cmd proto_rsp_cmd;
 static uint32_t proto_rsp_dst_sig;
 static uint16_t proto_rsp_value;
+static uint32_t proto_rsp_aux_sig;
 
 static bool proto_resume_rx_after_rsp;
 static uint8_t proto_rx_channel;
@@ -617,6 +620,35 @@ static void proto_u16_put_le(uint8_t *buf, uint16_t value)
 	buf[1] = (uint8_t)((value >> 8) & 0xFFu);
 }
 
+static uint32_t proto_local_profile_pack(void)
+{
+	uint32_t profile = ((uint32_t)proto_local_node_type & RADIO_SURVEY_PROFILE_TYPE_MASK);
+
+	if (proto_local_is_aggregator) {
+		profile |= RADIO_SURVEY_PROFILE_AGGREGATOR_BIT;
+	}
+
+	return profile;
+}
+
+static void proto_peer_profile_apply(struct radio_proto_peer *peer, uint32_t aux_signature)
+{
+	uint8_t type = (uint8_t)(aux_signature & RADIO_SURVEY_PROFILE_TYPE_MASK);
+
+	if (peer == NULL) {
+		return;
+	}
+
+	if (type == (uint8_t)RADIO_SURVEY_NODE_TYPE_X ||
+	    type == (uint8_t)RADIO_SURVEY_NODE_TYPE_Y) {
+		peer->node_type = type;
+	} else {
+		peer->node_type = RADIO_SURVEY_NODE_TYPE_UNKNOWN;
+	}
+
+	peer->is_data_aggregator = (aux_signature & RADIO_SURVEY_PROFILE_AGGREGATOR_BIT) != 0u;
+}
+
 static struct radio_proto_peer *proto_find_or_add_peer(uint32_t signature)
 {
 	for (uint8_t i = 0; i < proto_peer_count; i++) {
@@ -692,6 +724,12 @@ static bool proto_frame_for_me(uint32_t dst_signature)
 
 void radio_proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
 {
+	radio_proto_schedule_response_ext(cmd, dst_signature, value, 0u);
+}
+
+void radio_proto_schedule_response_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
+				       uint16_t value, uint32_t aux_signature)
+{
 	if (proto_role != RADIO_PROTO_ROLE_RX) {
 		return;
 	}
@@ -699,6 +737,7 @@ void radio_proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signat
 	proto_rsp_cmd = cmd;
 	proto_rsp_dst_sig = dst_signature;
 	proto_rsp_value = value;
+	proto_rsp_aux_sig = aux_signature;
 	proto_rsp_pending = true;
 
 	/* Spread responder transmissions and leave time for TX node to switch to RX. */
@@ -1466,6 +1505,7 @@ void radio_handler(const void *context)
 
 			if (frame_ok) {
 				rx_packet_cnt++;
+				radio_node_note_proto_frame_activity(frame.src_signature);
 
 				switch (frame.cmd) {
 				case RADIO_PROTO_CMD_DISCOVER_REQ:
@@ -1485,6 +1525,7 @@ void radio_handler(const void *context)
 						if (peer != NULL) {
 							if (VERBOSE_LOGGING) printk("Discovered peer 0x%08X\n", frame.src_signature);
 							peer->seen_discover_rsp = true;
+							proto_peer_profile_apply(peer, frame.aux_signature);
 						}
 					}
 					break;
@@ -1545,6 +1586,7 @@ void radio_handler(const void *context)
 					}
 					break;
 				case RADIO_PROTO_CMD_RELEASE_REQ:
+					if (VERBOSE_LOGGING) printk("Received RELEASE_REQ from 0x%08X\n", frame.src_signature);
 					radio_node_handle_proto_frame(&frame);
 					break;
 				case RADIO_PROTO_CMD_RELEASE_RSP:
@@ -1557,11 +1599,20 @@ void radio_handler(const void *context)
 						if (peer != NULL) {
 							peer->seen_release_rsp = true;
 						}
+					} else if (VERBOSE_LOGGING) {
+						printk("Ignoring RELEASE_RSP from 0x%08X (role=%u dst=0x%08X local=0x%08X)\n",
+						       frame.src_signature,
+						       (uint32_t)proto_role,
+						       frame.dst_signature,
+						       proto_local_signature);
 					}
 					break;
 				case RADIO_PROTO_CMD_REMOTE_TEST_REQ:
+				case RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK:
 				case RADIO_PROTO_CMD_REMOTE_TEST_REPORT:
 				case RADIO_PROTO_CMD_REMOTE_TEST_DONE:
+				case RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK:
+				case RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK:
 				case RADIO_PROTO_CMD_PROVISION_REQ:
 				case RADIO_PROTO_CMD_PROVISION_RSP:
 					radio_node_handle_proto_frame(&frame);
@@ -1624,7 +1675,11 @@ static void proto_rsp_work_handler(struct k_work *work)
 		return;
 	}
 
-	if (radio_proto_prepare_tx(proto_rsp_cmd, proto_rsp_dst_sig, proto_rsp_value) != 0) {
+	if (radio_proto_prepare_tx_ext(proto_rsp_cmd,
+				      proto_rsp_dst_sig,
+				      proto_rsp_value,
+				      proto_rsp_cmd == RADIO_PROTO_CMD_DISCOVER_RSP ?
+				      proto_local_profile_pack() : proto_rsp_aux_sig) != 0) {
 		return;
 	}
 
@@ -1644,6 +1699,18 @@ void radio_proto_set_signature(uint32_t signature)
 	proto_local_signature = signature;
 }
 
+void radio_proto_set_local_node_profile(enum radio_survey_node_type node_type,
+					      bool is_data_aggregator)
+{
+	if (node_type == RADIO_SURVEY_NODE_TYPE_X || node_type == RADIO_SURVEY_NODE_TYPE_Y) {
+		proto_local_node_type = node_type;
+	} else {
+		proto_local_node_type = RADIO_SURVEY_NODE_TYPE_UNKNOWN;
+	}
+
+	proto_local_is_aggregator = is_data_aggregator;
+}
+
 void radio_proto_set_role(enum radio_proto_role role)
 {
 	proto_role = role;
@@ -1652,6 +1719,16 @@ void radio_proto_set_role(enum radio_proto_role role)
 enum radio_proto_role radio_proto_get_role(void)
 {
 	return proto_role;
+}
+
+enum radio_survey_node_type radio_proto_get_local_node_type(void)
+{
+	return proto_local_node_type;
+}
+
+bool radio_proto_get_local_aggregator(void)
+{
+	return proto_local_is_aggregator;
 }
 
 void radio_proto_reset(void)
