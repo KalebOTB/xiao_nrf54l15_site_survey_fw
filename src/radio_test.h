@@ -243,6 +243,11 @@ enum radio_proto_cmd {
 	RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK,
 	RADIO_PROTO_CMD_PROVISION_REQ,
 	RADIO_PROTO_CMD_PROVISION_RSP,
+	RADIO_PROTO_CMD_CONTROL_ACK,
+	RADIO_PROTO_CMD_SHARED_LIST_CLEAR,
+	RADIO_PROTO_CMD_SHARED_LIST_ADD,
+	RADIO_PROTO_CMD_TEST_START,
+	RADIO_PROTO_CMD_TEST_END,
 };
 
 struct radio_proto_frame {
@@ -337,6 +342,13 @@ int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uin
 int radio_proto_prepare_tx_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
 			       uint16_t value, uint32_t aux_signature);
 
+int radio_proto_prepare_tx_raw(enum radio_proto_cmd cmd,
+			       uint8_t flags,
+			       uint32_t src_signature,
+			       uint32_t dst_signature,
+			       uint16_t value,
+			       uint32_t aux_signature);
+
 void radio_proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature,
 				       uint16_t value);
 
@@ -356,5 +368,11 @@ void radio_proto_reset_per_results(void);
 void radio_proto_reset_clear_per_results(void);
 
 void radio_proto_reset_release_results(void);
+
+void radio_proto_begin_test_session(uint32_t broadcaster_signature);
+
+void radio_proto_end_test_session(uint32_t broadcaster_signature);
+
+void radio_proto_reset_local_test_counter(void);
 
 #endif /* RADIO_TEST_H_ */

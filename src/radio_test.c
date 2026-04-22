@@ -138,6 +138,8 @@ static uint32_t proto_test_data_seen;
 static uint32_t proto_per_req_seen;
 static uint32_t proto_per_rsp_seen;
 static uint32_t proto_local_test_data_rx;
+static bool proto_test_session_active;
+static uint32_t proto_test_session_broadcaster;
 static struct radio_proto_peer proto_peers[RADIO_PROTO_MAX_PEERS];
 static uint8_t proto_peer_count;
 
@@ -708,6 +710,31 @@ static uint8_t proto_frame_encode(uint8_t *payload, size_t payload_capacity,
 	payload[2] = RADIO_PROTO_VERSION;
 	payload[3] = (uint8_t)cmd;
 	payload[4] = proto_seq++;
+	proto_u32_put_le(&payload[5], src_signature);
+	proto_u32_put_le(&payload[9], dst_signature);
+	proto_u32_put_le(&payload[13], aux_signature);
+	proto_u16_put_le(&payload[17], value);
+
+	return RADIO_PROTO_HEADER_SIZE;
+}
+
+static uint8_t proto_frame_encode_raw(uint8_t *payload, size_t payload_capacity,
+			      enum radio_proto_cmd cmd,
+			      uint8_t flags,
+			      uint32_t src_signature,
+			      uint32_t dst_signature,
+			      uint32_t aux_signature,
+			      uint16_t value)
+{
+	if (payload_capacity < RADIO_PROTO_HEADER_SIZE) {
+		return 0;
+	}
+
+	payload[0] = RADIO_PROTO_MAGIC0;
+	payload[1] = RADIO_PROTO_MAGIC1;
+	payload[2] = RADIO_PROTO_VERSION;
+	payload[3] = (uint8_t)cmd;
+	payload[4] = flags;
 	proto_u32_put_le(&payload[5], src_signature);
 	proto_u32_put_le(&payload[9], dst_signature);
 	proto_u32_put_le(&payload[13], aux_signature);
@@ -1530,10 +1557,11 @@ void radio_handler(const void *context)
 					}
 					break;
 				case RADIO_PROTO_CMD_TEST_DATA:
-					if (VERBOSE_LOGGING_ALL) printk("Received TEST_DATA from 0x%08X\n", frame.src_signature);
 					proto_test_data_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
-					    proto_frame_for_me(frame.dst_signature)) {
+					    proto_frame_for_me(frame.dst_signature) &&
+					    proto_test_session_active &&
+					    frame.src_signature == proto_test_session_broadcaster) {
 						proto_local_test_data_rx++;
 					}
 					break;
@@ -1567,6 +1595,8 @@ void radio_handler(const void *context)
 					if (VERBOSE_LOGGING) printk("Received CLEAR_PER_REQ from 0x%08X\n", frame.src_signature);
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature)) {
+						proto_test_session_active = false;
+						proto_test_session_broadcaster = 0u;
 						proto_local_test_data_rx = 0;
 						radio_proto_schedule_response(RADIO_PROTO_CMD_CLEAR_PER_RSP,
 									      frame.src_signature,
@@ -1613,6 +1643,11 @@ void radio_handler(const void *context)
 				case RADIO_PROTO_CMD_REMOTE_TEST_DONE:
 				case RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK:
 				case RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK:
+				case RADIO_PROTO_CMD_CONTROL_ACK:
+				case RADIO_PROTO_CMD_SHARED_LIST_CLEAR:
+				case RADIO_PROTO_CMD_SHARED_LIST_ADD:
+				case RADIO_PROTO_CMD_TEST_START:
+				case RADIO_PROTO_CMD_TEST_END:
 				case RADIO_PROTO_CMD_PROVISION_REQ:
 				case RADIO_PROTO_CMD_PROVISION_RSP:
 					radio_node_handle_proto_frame(&frame);
@@ -1731,6 +1766,32 @@ bool radio_proto_get_local_aggregator(void)
 	return proto_local_is_aggregator;
 }
 
+void radio_proto_begin_test_session(uint32_t broadcaster_signature)
+{
+	proto_test_session_broadcaster = broadcaster_signature;
+	proto_test_session_active = true;
+	proto_local_test_data_rx = 0u;
+}
+
+void radio_proto_end_test_session(uint32_t broadcaster_signature)
+{
+	if (broadcaster_signature != 0u &&
+	    proto_test_session_broadcaster != 0u &&
+	    proto_test_session_broadcaster != broadcaster_signature) {
+		return;
+	}
+
+	proto_test_session_active = false;
+	proto_test_session_broadcaster = 0u;
+}
+
+void radio_proto_reset_local_test_counter(void)
+{
+	proto_local_test_data_rx = 0u;
+	proto_test_session_active = false;
+	proto_test_session_broadcaster = 0u;
+}
+
 void radio_proto_reset(void)
 {
 	proto_discover_req_seen = 0;
@@ -1739,6 +1800,8 @@ void radio_proto_reset(void)
 	proto_per_req_seen = 0;
 	proto_per_rsp_seen = 0;
 	proto_local_test_data_rx = 0;
+	proto_test_session_active = false;
+	proto_test_session_broadcaster = 0u;
 	proto_peer_count = 0;
 	proto_rsp_pending = false;
 	proto_resume_rx_after_rsp = false;
@@ -1775,6 +1838,37 @@ int radio_proto_prepare_tx_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
 int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uint16_t value)
 {
 	return radio_proto_prepare_tx_ext(cmd, dst_signature, value, 0u);
+}
+
+int radio_proto_prepare_tx_raw(enum radio_proto_cmd cmd,
+			       uint8_t flags,
+			       uint32_t src_signature,
+			       uint32_t dst_signature,
+			       uint16_t value,
+			       uint32_t aux_signature)
+{
+	uint8_t len;
+
+	if (src_signature == 0u) {
+		return -EINVAL;
+	}
+
+	len = proto_frame_encode_raw(proto_tx_override_payload,
+				 sizeof(proto_tx_override_payload),
+				 cmd,
+				 flags,
+				 src_signature,
+				 dst_signature,
+				 aux_signature,
+				 value);
+	if (len == 0) {
+		return -EINVAL;
+	}
+
+	proto_tx_override_len = len;
+	proto_tx_override_valid = true;
+
+	return 0;
 }
 
 void radio_proto_get_status(struct radio_proto_status *status)

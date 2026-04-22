@@ -17,22 +17,27 @@ Typical outcomes:
 
 ## Node Roles
 
-### Node Mode (runtime behavior)
-Use node_mode for runtime control:
-- unassigned
-- coordinator
-- receiver
-- test_tx
+All boards use the same firmware image and participate in the same PER workflow.
 
-### Node Type (site-survey role)
-Use node_type for survey policy:
-- x: link-capable node, can run PER against x and y peers
-- y: sensor/data node, can run PER only against x peers
+### Aggregator / Coordinator
+- One node is connected to the logger/PC.
+- It discovers nodes, shares the discovered-node list, coordinates broadcaster rotation, and logs all PER results.
+- It also participates in PER as a normal node.
+- The aggregator is always the first broadcaster in a `proto_test_run` cycle.
 
-### Aggregator Flag
-Use node_aggregator to mark the board connected to your logger/PC:
-- on: this board is the data aggregator endpoint
-- off: normal node
+### Broadcaster
+- Exactly one node is the broadcaster at a time.
+- The broadcaster sends `TEST_START` control messages to each receiver, transmits the PER packet burst, sends `TEST_END`, then requests PER results from each receiver.
+- When the broadcaster is not active, it behaves as a receiver.
+
+### Receiver
+- Any node that is not the current broadcaster is a receiver.
+- Receivers only count `TEST_DATA` packets during an explicitly active test window for the current broadcaster.
+- After `TEST_END`, receivers respond to PER requests with the number of packets received.
+
+### Node Type / Aggregator Flag
+- `node_aggregator on|off` still marks the logger-connected node.
+- `node_type` remains available as persisted metadata, but the coordinator-managed PER sweep treats discovered nodes as identical test participants.
 
 ## Quick Start
 
@@ -47,15 +52,9 @@ node_aggregator on
 log_mode minimal
 ```
 
-2. Configure other boards (examples)
+2. Configure other boards
 
 ```bash
-# Link-capable board
-node_type x
-node_aggregator off
-
-# Sensor/data board
-node_type y
 node_aggregator off
 ```
 
@@ -70,10 +69,15 @@ discover_status
 4. Run full PER flow
 
 ```bash
-proto_test_run 100 200 200
+proto_test_run 10 400 400
 ```
 
-This runs local TX/PER collection plus delegated round-robin tests and emits PER_REPORT lines.
+This runs the full coordinator-managed sweep:
+- coordinator discovers peers and builds the discovered-node list
+- coordinator shares that list to all discovered nodes
+- coordinator runs the first broadcaster cycle locally
+- each remaining discovered node is then told to become broadcaster in turn
+- all PER results are reported back to the aggregator and emitted as `PER_REPORT`
 
 ## Required Radio Settings
 
@@ -91,14 +95,14 @@ Valid IEEE channels: 11-26.
 | Command | Purpose |
 |---|---|
 | node_mode <unassigned|coordinator|receiver|test_tx> | Set runtime mode |
-| node_type <x|y> | Set site-survey node type |
+| node_type <x|y> | Persist optional node metadata |
 | node_aggregator <on|off> | Mark node as data aggregator |
 | node_status | Show mode/signatures/type/aggregator |
 | discover_list_clear | Clear local discovered list and request discovered peers return to unassigned |
 | proto_send_discover [wait_ms] | Discover peers |
 | discover_status | Print discovered peers including type + aggregator metadata |
-| proto_test_run [packets] [wait_ms] [retry_ms] | Full local + delegated PER run |
-| proto_round_robin_run [packets] [wait_ms] [retry_ms] | Delegated-only run |
+| proto_test_run [packets] [wait_ms] [retry_ms] | Full coordinator-managed broadcaster sweep |
+| proto_round_robin_run [packets] [wait_ms] [retry_ms] | Remote broadcaster sweep for discovered peers |
 | cancel | Stop active wait loops |
 
 ## Machine-Readable UART Output
@@ -109,9 +113,16 @@ Your host parser should consume:
 - DISCOVER_STATUS,index,signature,node_type,is_aggregator
 - PER_REPORT,<tx_serial>,<rx_serial>,<total_sent>,<total_received>
 
+During debug builds or when verbose protocol diagnostics are enabled, additional coordinator lifecycle lines may appear, such as `RR_DIAG,...` and `RTW_DIAG,...`.
+
 ## Notes
 
 - Boards boot in IEEE 802.15.4 mode on channel 15.
 - After reset/power cycle, nodes start in unassigned mode and should be rediscovered.
 - node_type and node_aggregator are persisted in non-volatile settings.
-- Y->Y PER collection is intentionally blocked by policy; y nodes only target x peers.
+- `proto_test_run` shares the discovered-node list to all discovered nodes before rotating broadcasters.
+- Control-plane steps use per-node ACK/retry handling. `TEST_DATA` packets remain one-to-many and are intentionally unacked.
+- Receivers only count packets inside the current broadcaster's active test window, bounded by explicit start/end commands.
+- Control/result frames used for coordination and reporting are relay-capable: intermediate nodes may forward those unicast frames to reach nodes that are not directly reachable.
+- Relay forwarding uses duplicate suppression to limit looped rebroadcast of the same control/result frame.
+- `TEST_DATA` remains direct broadcaster-to-receivers traffic (no ACK and no relay), matching PER measurement behavior.
