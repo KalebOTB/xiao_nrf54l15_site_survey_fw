@@ -9,6 +9,7 @@
 #include "local_config.h"
 #include <string.h>
 #include <inttypes.h>
+#include <limits.h>
 
 #if !(defined(CONFIG_SOC_SERIES_NRF54HX) || defined(CONFIG_SOC_SERIES_NRF54LX))
 #include <hal/nrf_power.h>
@@ -97,6 +98,40 @@ static uint32_t rx_packet_cnt;
 /* Radio current channel (frequency). */
 static uint8_t current_channel;
 
+static int16_t radio_get_rssi_dbm(void)
+{
+	/* Trigger a fresh RSSI sample and allow hardware to settle briefly. */
+	nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_RSSISTART);
+	k_busy_wait(8);
+
+	/* RSSISAMPLE is encoded as positive magnitude of a negative dBm value. */
+	int16_t rssi_dbm = -(int16_t)nrf_radio_rssi_sample_get(NRF_RADIO);
+
+	/* If hardware reports invalid/sentinel values, expose as unavailable. */
+	if (rssi_dbm <= -127) {
+		return INT16_MIN;
+	}
+
+	return rssi_dbm;
+}
+
+bool radio_test_sample_rssi_dbm(int16_t *rssi_dbm)
+{
+	int16_t sample;
+
+	if (rssi_dbm == NULL) {
+		return false;
+	}
+
+	sample = radio_get_rssi_dbm();
+	if (sample == INT16_MIN) {
+		return false;
+	}
+
+	*rssi_dbm = sample;
+	return true;
+}
+
 /* Timer used for channel sweeps and tx with duty cycle. */
 static nrfx_timer_t timer =
 	NRFX_TIMER_INSTANCE(NRF_TIMER_INST_GET(RADIO_TEST_TIMER_INSTANCE));
@@ -156,6 +191,7 @@ static uint32_t proto_rsp_aux_sig;
 static bool proto_resume_rx_after_rsp;
 static uint8_t proto_rx_channel;
 static enum transmit_pattern proto_rx_pattern;
+static volatile int16_t proto_last_rx_rssi_dbm = INT16_MIN;
 
 static void proto_rsp_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(proto_rsp_work, proto_rsp_work_handler);
@@ -1168,14 +1204,19 @@ static void radio_rx(uint8_t mode, uint8_t channel, enum transmit_pattern patter
 	radio_channel_set(mode, channel);
 	proto_rx_channel = channel;
 	proto_rx_pattern = pattern;
+	proto_last_rx_rssi_dbm = INT16_MIN;
 
 	rx_packet_cnt = 0;
 
-	/* Enable CRCOK and END interrupts so we can detect frames that finish
+	/* Enable ADDRESS and CRCOK interrupts so we can sample RSSI while payload
+	 * is actively being received and then process only valid packets.
 	 * but fail CRC (END without CRCOK). This helps with diagnosing why
 	 * no CRCOK events are observed.
 	 */
-	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK);// | RADIO_TEST_INT_END_MASK);
+	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK);
+#if defined(RADIO_INTENSET_ADDRESS_Msk) || defined(RADIO_INTENSET00_ADDRESS_Msk)
+	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_ADDRESS_MASK);
+#endif
 
 
 #if CONFIG_FEM
@@ -1520,9 +1561,21 @@ void radio_handler(const void *context)
 	const struct radio_test_config *config =
 		(const struct radio_test_config *) context;
 
+#if defined(RADIO_INTENSET_ADDRESS_Msk) || defined(RADIO_INTENSET00_ADDRESS_Msk)
+	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_ADDRESS_MASK) &&
+	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_ADDRESS)) {
+		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_ADDRESS);
+		proto_last_rx_rssi_dbm = radio_get_rssi_dbm();
+	}
+#endif
+
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK) &&
 	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_CRCOK)) {
+		int16_t rssi_dbm;
+
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_CRCOK);
+		rssi_dbm = proto_last_rx_rssi_dbm;
+		proto_last_rx_rssi_dbm = INT16_MIN;
 
 #if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
 		if (nrf_radio_mode_get(NRF_RADIO) == NRF_RADIO_MODE_IEEE802154_250KBIT) {
@@ -1531,6 +1584,11 @@ void radio_handler(const void *context)
 			bool frame_ok = proto_frame_decode(rx_packet + 1, payload_len, &frame);
 
 			if (frame_ok) {
+				if (rssi_dbm == INT16_MIN) {
+					printk("RX_RSSI,src=0x%08X,NA\n", frame.src_signature);
+				} else {
+					printk("RX_RSSI,src=0x%08X,%d dBm\n", frame.src_signature, rssi_dbm);
+				}
 				rx_packet_cnt++;
 				radio_node_note_proto_frame_activity(frame.src_signature);
 
@@ -1656,12 +1714,27 @@ void radio_handler(const void *context)
 					break;
 				}
 			} else {
+				if (rssi_dbm == INT16_MIN) {
+					printk("RX_RSSI,src=unknown,NA\n");
+				} else {
+					printk("RX_RSSI,src=unknown,%d dBm\n", rssi_dbm);
+				}
 				rx_packet_cnt++;
 			}
 		} else {
+			if (rssi_dbm == INT16_MIN) {
+				printk("RX_RSSI,src=unknown,NA\n");
+			} else {
+				printk("RX_RSSI,src=unknown,%d dBm\n", rssi_dbm);
+			}
 			rx_packet_cnt++;
 		}
 #else
+		if (rssi_dbm == INT16_MIN) {
+			printk("RX_RSSI,src=unknown,NA\n");
+		} else {
+			printk("RX_RSSI,src=unknown,%d dBm\n", rssi_dbm);
+		}
 		rx_packet_cnt++;
 #endif /* CONFIG_HAS_HW_NRF_RADIO_IEEE802154 */
 

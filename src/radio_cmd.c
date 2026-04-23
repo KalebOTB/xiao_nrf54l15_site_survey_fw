@@ -153,22 +153,32 @@ static volatile bool proto_release_cancel;
 static volatile bool proto_remote_test_cancel;
 static struct k_work node_button_work;
 static struct k_work node_apply_receiver_work;
-static struct k_work remote_test_work;
+static struct k_work_delayable remote_test_work;
 static struct k_work_delayable node_release_work;
 static struct k_work_delayable node_settings_save_work;
 static volatile bool proto_collect_per_cancel;
+static volatile bool rssi_monitor_cancel;
+static volatile bool rssi_monitor_active;
+static uint32_t rssi_monitor_interval_ms = 250u;
 
-#define NODE_RELEASE_APPLY_DELAY_MS 80
+static void rssi_monitor_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(rssi_monitor_work, rssi_monitor_work_handler);
+
+#define NODE_RELEASE_APPLY_DELAY_MS 200
 #define NODE_SETTINGS_SAVE_DELAY_MS 300
+#define RSSI_MONITOR_INTERVAL_MIN_MS 20u
 #define REMOTE_TEST_REPORT_RETRY_MAX 5
 #define REMOTE_TEST_DONE_RETRY_MAX 5
 #define REMOTE_TEST_DELEGATE_TIMEOUT_MIN_MS 4000u
 #define PRETEST_CLEAR_RETRY_MAX 3u
 #define REMOTE_TEST_REQ_RETRY_MAX 3u
 #define REMOTE_TEST_REQ_ACK_WAIT_MIN_MS 120u
+#define REMOTE_TEST_WORK_START_DELAY_MS 70u
 #define REMOTE_TEST_DISCOVER_ROUNDS 2u
 #define PROTO_PER_PHASE_MAX_ROUNDS 6u
 #define CONTROL_ACK_RETRY_MAX 3u
+#define CONTROL_ACK_WAIT_MIN_MS 300u
+#define TEST_START_SETTLE_MS 60u
 #define SHARED_TEST_LIST_MAX (RADIO_PROTO_MAX_PEERS + 1u)
 #define RELAY_QUEUE_MAX 24u
 #define RELAY_SEEN_MAX 64u
@@ -787,6 +797,7 @@ static int cmd_start_channel_set(const struct shell *shell, size_t argc,
 				 char **argv)
 {
 	uint32_t channel;
+	enum radio_node_mode mode = (enum radio_node_mode)node_cfg.mode;
 
 	if (argc == 1) {
 		shell_help(shell);
@@ -805,9 +816,26 @@ static int cmd_start_channel_set(const struct shell *shell, size_t argc,
 		return -EINVAL;
 	}
 
+	if (config.mode == NRF_RADIO_MODE_IEEE802154_250KBIT &&
+	    (channel < IEEE_MIN_CHANNEL || channel > IEEE_MAX_CHANNEL)) {
+		shell_error(shell,
+			    "For ieee802154_250Kbit, channel must be between %d and %d",
+			    IEEE_MIN_CHANNEL,
+			    IEEE_MAX_CHANNEL);
+		return -EINVAL;
+	}
+
 	config.channel_start = (uint8_t) channel;
 
-	shell_print(shell, "Start channel set to: %d", channel);
+	/* Reapply current mode so active RX is retuned immediately. */
+	if (mode == RADIO_NODE_MODE_COORDINATOR ||
+	    mode == RADIO_NODE_MODE_RECEIVER ||
+	    mode == RADIO_NODE_MODE_UNASSIGNED) {
+		node_apply_mode(mode);
+		shell_print(shell, "Start channel set to: %d (RX retuned)", channel);
+	} else {
+		shell_print(shell, "Start channel set to: %d", channel);
+	}
 	return 0;
 }
 
@@ -830,6 +858,15 @@ static int cmd_end_channel_set(const struct shell *shell, size_t argc,
 
 	if (channel > 80) {
 		shell_error(shell, "Channel must be between 0 and 80");
+		return -EINVAL;
+	}
+
+	if (config.mode == NRF_RADIO_MODE_IEEE802154_250KBIT &&
+	    (channel < IEEE_MIN_CHANNEL || channel > IEEE_MAX_CHANNEL)) {
+		shell_error(shell,
+			    "For ieee802154_250Kbit, channel must be between %d and %d",
+			    IEEE_MIN_CHANNEL,
+			    IEEE_MAX_CHANNEL);
 		return -EINVAL;
 	}
 
@@ -866,13 +903,96 @@ static int cmd_time_set(const struct shell *shell, size_t argc, char **argv)
 	return 0;
 }
 
+static void rssi_monitor_work_handler(struct k_work *work)
+{
+	int16_t rssi_dbm;
+
+	ARG_UNUSED(work);
+
+	if (!rssi_monitor_active || rssi_monitor_cancel) {
+		return;
+	}
+
+	if (radio_test_sample_rssi_dbm(&rssi_dbm)) {
+		printk("ROOM_RSSI,%d dBm\n", rssi_dbm);
+	} else {
+		printk("ROOM_RSSI,NA\n");
+	}
+
+	k_work_reschedule(&rssi_monitor_work, K_MSEC(rssi_monitor_interval_ms));
+}
+
 static int cmd_cancel(const struct shell *shell, size_t argc, char **argv)
 {
 	proto_collect_per_cancel = true;
 	proto_release_cancel = true;
 	proto_remote_test_cancel = true;
+	rssi_monitor_cancel = true;
+	rssi_monitor_active = false;
+	k_work_cancel_delayable(&rssi_monitor_work);
 	radio_test_cancel(test_config.type);
 	test_in_progress = false;
+	return 0;
+}
+
+static int cmd_rssi_monitor(const struct shell *shell, size_t argc, char **argv)
+{
+	uint32_t interval_ms = rssi_monitor_interval_ms;
+
+	if (argc > 2) {
+		shell_error(shell, "Usage: rssi_monitor [interval_ms|stop]");
+		return -EINVAL;
+	}
+
+	if (argc == 2 && strcmp(argv[1], "stop") == 0) {
+		rssi_monitor_cancel = true;
+		rssi_monitor_active = false;
+		k_work_cancel_delayable(&rssi_monitor_work);
+		radio_test_cancel(test_config.type);
+		test_in_progress = false;
+		shell_print(shell, "RSSI monitor stopped");
+		return 0;
+	}
+
+	if (argc == 2) {
+		interval_ms = strtoul(argv[1], NULL, 0);
+		if (interval_ms < RSSI_MONITOR_INTERVAL_MIN_MS) {
+			shell_error(shell, "interval_ms must be >= %u", RSSI_MONITOR_INTERVAL_MIN_MS);
+			return -EINVAL;
+		}
+	}
+
+#if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
+	ieee_channel_check(shell, config.channel_start);
+#endif /* CONFIG_HAS_HW_NRF_RADIO_IEEE802154 */
+
+	if (test_in_progress) {
+		radio_test_cancel(test_config.type);
+		test_in_progress = false;
+	}
+
+	memset(&test_config, 0, sizeof(test_config));
+	test_config.type = RX;
+	test_config.mode = config.mode;
+	test_config.params.rx.channel = config.channel_start;
+	test_config.params.rx.pattern = TRANSMIT_PATTERN_RANDOM;
+	test_config.params.rx.packets_num = 0;
+#if CONFIG_FEM
+	test_config.fem = config.fem;
+#endif /* CONFIG_FEM */
+
+	radio_test_start(&test_config);
+	test_in_progress = true;
+
+	rssi_monitor_interval_ms = interval_ms;
+	rssi_monitor_cancel = false;
+	rssi_monitor_active = true;
+	k_work_reschedule(&rssi_monitor_work, K_NO_WAIT);
+
+	shell_print(shell,
+		   "RSSI monitor started on channel %u, interval %u ms (use 'cancel' or 'rssi_monitor stop')",
+		   config.channel_start,
+		   interval_ms);
 	return 0;
 }
 
@@ -1845,9 +1965,6 @@ static int cmd_print_payload(const struct shell *shell, size_t argc,
 
 static void proto_single_tx_done(void)
 {
-	if (VERBOSE_LOGGING_ALL) {
-		printk("TX DONE SIGNAL GIVEN\n");
-	}
 	k_sem_give(&proto_tx_done_sem);
 }
 
@@ -2008,6 +2125,12 @@ static bool proto_send_control_with_retry(const struct shell *shell,
 					       uint32_t wait_ms,
 					       uint32_t retry_ms)
 {
+	uint32_t ack_wait_ms = wait_ms;
+
+	if (ack_wait_ms < CONTROL_ACK_WAIT_MIN_MS) {
+		ack_wait_ms = CONTROL_ACK_WAIT_MIN_MS;
+	}
+
 	for (uint8_t attempt = 0; attempt < CONTROL_ACK_RETRY_MAX; attempt++) {
 		proto_control_ack_reset();
 		if (proto_verbose_logging_enabled()) {
@@ -2017,7 +2140,7 @@ static bool proto_send_control_with_retry(const struct shell *shell,
 			       context_signature,
 			       (unsigned int)(attempt + 1u),
 			       (unsigned int)CONTROL_ACK_RETRY_MAX,
-			       (unsigned int)wait_ms,
+			       (unsigned int)ack_wait_ms,
 			       (unsigned int)retry_ms);
 		}
 		radio_proto_set_role(RADIO_PROTO_ROLE_TX);
@@ -2033,7 +2156,7 @@ static bool proto_send_control_with_retry(const struct shell *shell,
 		}
 
 		k_msleep(2);
-		proto_rx_window(wait_ms);
+		proto_rx_window(ack_wait_ms);
 
 		if (control_ack_received &&
 		    control_ack_sender == dst_signature &&
@@ -2277,7 +2400,7 @@ int radio_node_init(void)
 			   K_THREAD_STACK_SIZEOF(remote_test_workq_stack),
 			   CONFIG_SYSTEM_WORKQUEUE_PRIORITY,
 			   NULL);
-	k_work_init(&remote_test_work, remote_test_work_handler);
+	k_work_init_delayable(&remote_test_work, remote_test_work_handler);
 	k_work_init(&relay_forward_work, relay_forward_work_handler);
 	k_work_init_delayable(&node_release_work, node_release_work_handler);
 	k_work_init_delayable(&node_settings_save_work, node_settings_save_work_handler);
@@ -2468,7 +2591,9 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 		radio_proto_schedule_response(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
 					     frame->src_signature,
 					     frame->value);
-		k_work_submit_to_queue(&remote_test_workq, &remote_test_work);
+		k_work_reschedule_for_queue(&remote_test_workq,
+					  &remote_test_work,
+					  K_MSEC(REMOTE_TEST_WORK_START_DELAY_MS));
 		if (proto_verbose_logging_enabled()) {
 			printk("Remote test request accepted from 0x%08x\n", frame->src_signature);
 		}
@@ -2557,6 +2682,12 @@ void radio_node_handle_discover_req(uint32_t src_signature, uint32_t dst_signatu
 	if (!for_me) {
 		return;
 	}
+
+	/* Cancel any pending delayed release from a prior discover_list_clear pass.
+	 * Otherwise a stale release work item can flip this node back to unassigned
+	 * while a fresh DISCOVER_RSP/provisioning flow is in progress.
+	 */
+	(void)k_work_cancel_delayable(&node_release_work);
 
 	if (node_cfg.mode == RADIO_NODE_MODE_TEST_TX) {
 		return;
@@ -3237,7 +3368,6 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 		/* Delegate is silent while it performs discovery/PER/CLEAR phases.
 		 * Scale inactivity timeout with wait/retry parameters and keep a generous floor. */
 		uint32_t inactivity_timeout_ms = ((wait_ms + retry_ms) * 24u) + 5000u;
-		uint32_t activity_mark;
 		uint32_t last_inactivity_ms = 0u;
 		uint16_t synthesized_reports = 0u;
 		bool timed_out = false;
@@ -3261,7 +3391,6 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 		remote_test_monitor.reported_peers = 0u;
 		remote_test_monitor.reported_peer_count = 0u;
 		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
-		activity_mark = remote_test_monitor.last_activity_ticks;
 		memset(remote_test_monitor.reported_peer_sigs, 0, sizeof(remote_test_monitor.reported_peer_sigs));
 		if (shell != NULL) {
 			shell_print(shell,
@@ -3309,18 +3438,6 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 			}
 		}
 
-		if (!req_acked) {
-			if (remote_test_monitor.last_activity_ticks != activity_mark) {
-				req_acked = true;
-				ack_reason = "activity";
-				if (proto_verbose_logging_enabled()) {
-					shell_print(shell,
-					   "Round-robin: inferred REMOTE_TEST_REQ acceptance from activity 0x%08x",
-					   peer_sigs[i]);
-				}
-			}
-		}
-
 		if (shell != NULL) {
 			shell_print(shell,
 				   "RR_DIAG,req,delegate=0x%08x,acked=%u,reason=%s,ack_packets=%u",
@@ -3334,8 +3451,9 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 			ack_reason = "none";
 			if (proto_verbose_logging_enabled()) {
 				shell_print(shell,
-					   "Round-robin: no REMOTE_TEST_REQ_ACK from 0x%08x",
-					   peer_sigs[i]);
+					   "Round-robin: no REMOTE_TEST_REQ_ACK from 0x%08x after %u attempts",
+					   peer_sigs[i],
+					   (unsigned int)REMOTE_TEST_REQ_RETRY_MAX);
 			}
 
 			/* Keep output matrix complete even if delegate never acknowledged request. */
@@ -3636,6 +3754,7 @@ static void remote_test_work_handler(struct k_work *work)
 				      peer_count,
 				      request.wait_ms,
 				      request.retry_ms);
+	k_msleep(TEST_START_SETTLE_MS);
 
 	if (peer_count > 0u && request.packets > 0u) {
 		if (proto_send_frame_ex(NULL,
@@ -3922,6 +4041,7 @@ static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **arg
 				      cycle_count,
 				      wait_ms,
 				      retry_ms);
+	k_msleep(TEST_START_SETTLE_MS);
 
 	if (proto_send_frame(shell,
 		    RADIO_PROTO_CMD_TEST_DATA,
@@ -4439,6 +4559,9 @@ SHELL_CMD_REGISTER(start_rx_sweep, NULL, "Start RX sweep", cmd_rx_sweep_start);
 SHELL_CMD_REGISTER(start_tx_sweep, NULL, "Start TX sweep", cmd_tx_sweep_start);
 SHELL_CMD_REGISTER(start_rx, NULL, "Start RX", cmd_rx_start);
 SHELL_CMD_REGISTER(print_rx, NULL, "Print RX payload", cmd_print_payload);
+SHELL_CMD_REGISTER(rssi_monitor, NULL,
+		   "Start ambient RSSI monitor [interval_ms] or stop",
+		   cmd_rssi_monitor);
 SHELL_CMD_REGISTER(node_mode, NULL,
 		   "Set node mode <unassigned|coordinator|receiver|test_tx>",
 		   cmd_node_mode);

@@ -43,33 +43,43 @@ All boards use the same firmware image and participate in the same PER workflow.
 
 Use one PC-connected board as controller/logger. Flash the same firmware to all boards.
 
-1. Configure controller/logger board
+1. Configure **other boards first** (before coordinator starts discovery)
 
 ```bash
-node_mode coordinator
-node_type x
-node_aggregator on
-log_mode minimal
-```
-
-2. Configure other boards
-
-```bash
+data_rate ieee802154_250Kbit
+start_channel 26
+end_channel 26
 node_aggregator off
 ```
 
-3. Build a fresh discovery set
+> Channel must be set before any active radio operation. All nodes must be on the same channel.
+
+2. Configure controller/logger board
+
+```bash
+data_rate ieee802154_250Kbit
+start_channel 26
+end_channel 26
+node_mode coordinator
+node_type x
+node_aggregator on
+log_mode verbose
+```
+
+> Set channel **before** `node_mode coordinator` so discovery runs on the correct channel.
+
+3. Run discovery from the coordinator
 
 ```bash
 discover_list_clear
-proto_send_discover 500
+proto_send_discover 200
 discover_status
 ```
 
 4. Run full PER flow
 
 ```bash
-proto_test_run 10 400 400
+proto_test_run 1000 200 200
 ```
 
 This runs the full coordinator-managed sweep:

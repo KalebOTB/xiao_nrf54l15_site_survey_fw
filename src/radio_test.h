@@ -315,6 +315,8 @@ void radio_test_cancel(enum radio_test_mode type);
  */
 void radio_rx_stats_get(struct radio_rx_stats *rx_stats);
 
+bool radio_test_sample_rssi_dbm(int16_t *rssi_dbm);
+
 /**
  * @brief Function for toggling the DC/DC converter state.
  *
