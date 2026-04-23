@@ -50,6 +50,7 @@ data_rate ieee802154_250Kbit
 start_channel 26
 end_channel 26
 node_aggregator off
+output_power pos8dBm
 ```
 
 > Channel must be set before any active radio operation. All nodes must be on the same channel.
@@ -64,6 +65,7 @@ node_mode coordinator
 node_type x
 node_aggregator on
 log_mode verbose
+output_power pos8dBm
 ```
 
 > Set channel **before** `node_mode coordinator` so discovery runs on the correct channel.
@@ -79,7 +81,7 @@ discover_status
 4. Run full PER flow
 
 ```bash
-proto_test_run 1000 200 200
+proto_test_run 100 200 200
 ```
 
 This runs the full coordinator-managed sweep:

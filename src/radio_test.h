@@ -326,6 +326,8 @@ void toggle_dcdc_state(uint8_t dcdc_state);
 
 void radio_proto_set_signature(uint32_t signature);
 
+void radio_proto_set_response_txpower(int8_t txpower);
+
 void radio_proto_set_local_node_profile(enum radio_survey_node_type node_type,
 					      bool is_data_aggregator);
 

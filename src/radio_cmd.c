@@ -96,6 +96,12 @@ static struct radio_param_config default_config = {
 #endif /* CONFIG_FEM */
 };
 
+static void set_config_txpower(int8_t txpower)
+{
+	config.txpower = txpower;
+	radio_proto_set_response_txpower(config.txpower);
+}
+
 /* Radio test configuration. */
 static struct radio_test_config test_config;
 
@@ -166,7 +172,7 @@ K_WORK_DELAYABLE_DEFINE(rssi_monitor_work, rssi_monitor_work_handler);
 
 #define NODE_RELEASE_APPLY_DELAY_MS 200
 #define NODE_SETTINGS_SAVE_DELAY_MS 300
-#define RSSI_MONITOR_INTERVAL_MIN_MS 20u
+#define RSSI_MONITOR_INTERVAL_MIN_MS 1u
 #define REMOTE_TEST_REPORT_RETRY_MAX 5
 #define REMOTE_TEST_DONE_RETRY_MAX 5
 #define REMOTE_TEST_DELEGATE_TIMEOUT_MIN_MS 4000u
@@ -1478,7 +1484,7 @@ static int cmd_rx_start(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos10dBm)
 static void cmd_pos10dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 10;
+	set_config_txpower((int8_t)(10));
 	shell_print(shell, "TX power: %d", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos10dBm) */
@@ -1486,7 +1492,7 @@ static void cmd_pos10dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos9dBm)
 static void cmd_pos9dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 9;
+	set_config_txpower((int8_t)(9));
 	shell_print(shell, "TX power: %d", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos9dBm) */
@@ -1494,7 +1500,7 @@ static void cmd_pos9dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos8dBm)
 static void cmd_pos8dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 8;
+	set_config_txpower((int8_t)(8));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos8dBm) */
@@ -1502,7 +1508,7 @@ static void cmd_pos8dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos7dBm)
 static void cmd_pos7dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 7;
+	set_config_txpower((int8_t)(7));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos7dBm) */
@@ -1510,7 +1516,7 @@ static void cmd_pos7dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos6dBm)
 static void cmd_pos6dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 6;
+	set_config_txpower((int8_t)(6));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos6dBm) */
@@ -1518,7 +1524,7 @@ static void cmd_pos6dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos5dBm)
 static void cmd_pos5dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 5;
+	set_config_txpower((int8_t)(5));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos5dBm) */
@@ -1526,7 +1532,7 @@ static void cmd_pos5dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos4dBm)
 static void cmd_pos4dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 4;
+	set_config_txpower((int8_t)(4));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos4dBm) */
@@ -1534,7 +1540,7 @@ static void cmd_pos4dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos3dBm)
 static void cmd_pos3dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 3;
+	set_config_txpower((int8_t)(3));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos3dBm) */
@@ -1542,7 +1548,7 @@ static void cmd_pos3dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos2dBm)
 static void cmd_pos2dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 2;
+	set_config_txpower((int8_t)(2));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos2dBm) */
@@ -1550,21 +1556,21 @@ static void cmd_pos2dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Pos1dBm)
 static void cmd_pos1dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 1;
+	set_config_txpower((int8_t)(1));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Pos1dBm) */
 
 static void cmd_pos0dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = 0;
+	set_config_txpower((int8_t)(0));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 
 #if defined(RADIO_TXPOWER_TXPOWER_Neg1dBm)
 static void cmd_neg1dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -1;
+	set_config_txpower((int8_t)(-1));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg1dBm) */
@@ -1572,7 +1578,7 @@ static void cmd_neg1dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg2dBm)
 static void cmd_neg2dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -2;
+	set_config_txpower((int8_t)(-2));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg2dBm) */
@@ -1580,21 +1586,21 @@ static void cmd_neg2dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg3dBm)
 static void cmd_neg3dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -3;
+	set_config_txpower((int8_t)(-3));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg3dBm) */
 
 static void cmd_neg4dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -4;
+	set_config_txpower((int8_t)(-4));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 
 #if defined(RADIO_TXPOWER_TXPOWER_Neg5dBm)
 static void cmd_neg5dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -5;
+	set_config_txpower((int8_t)(-5));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg5dBm) */
@@ -1602,7 +1608,7 @@ static void cmd_neg5dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg6dBm)
 static void cmd_neg6dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -6;
+	set_config_txpower((int8_t)(-6));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg6dBm) */
@@ -1610,21 +1616,21 @@ static void cmd_neg6dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg7dBm)
 static void cmd_neg7dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -7;
+	set_config_txpower((int8_t)(-7));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg7dBm) */
 
 static void cmd_neg8dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -8;
+	set_config_txpower((int8_t)(-8));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 
 #if defined(RADIO_TXPOWER_TXPOWER_Neg9dBm)
 static void cmd_neg9dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -9;
+	set_config_txpower((int8_t)(-9));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg9dBm) */
@@ -1632,49 +1638,49 @@ static void cmd_neg9dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg10dBm)
 static void cmd_neg10dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -10;
+	set_config_txpower((int8_t)(-10));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg10dBm) */
 
 static void cmd_neg12dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -12;
+	set_config_txpower((int8_t)(-12));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 
 #if defined(RADIO_TXPOWER_TXPOWER_Neg14dBm)
 static void cmd_neg14dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -14;
+	set_config_txpower((int8_t)(-14));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg14dBm) */
 
 static void cmd_neg16dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -16;
+	set_config_txpower((int8_t)(-16));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 
 #if defined(RADIO_TXPOWER_TXPOWER_Neg18dBm)
 static void cmd_neg18dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -18;
+	set_config_txpower((int8_t)(-18));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg18dBm) */
 
 static void cmd_neg20dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -20;
+	set_config_txpower((int8_t)(-20));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 
 #if defined(RADIO_TXPOWER_TXPOWER_Neg22dBm)
 static void cmd_neg22dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -22;
+	set_config_txpower((int8_t)(-22));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg22dBm) */
@@ -1682,7 +1688,7 @@ static void cmd_neg22dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg28dBm)
 static void cmd_neg28dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -28;
+	set_config_txpower((int8_t)(-28));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg28dBm) */
@@ -1690,21 +1696,21 @@ static void cmd_neg28dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg30dBm)
 static void cmd_neg30dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -30;
+	set_config_txpower((int8_t)(-30));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg30dBm) */
 
 static void cmd_neg40dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -40;
+	set_config_txpower((int8_t)(-40));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 
 #if defined(RADIO_TXPOWER_TXPOWER_Neg46dBm)
 static void cmd_neg46dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -46;
+	set_config_txpower((int8_t)(-46));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg46dBm) */
@@ -1712,7 +1718,7 @@ static void cmd_neg46dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg70dBm)
 static void cmd_neg70dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -70;
+	set_config_txpower((int8_t)(-70));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg70dBm) */
@@ -1720,7 +1726,7 @@ static void cmd_neg70dbm(const struct shell *shell, size_t argc, char **argv)
 #if defined(RADIO_TXPOWER_TXPOWER_Neg100dBm)
 static void cmd_neg100dbm(const struct shell *shell, size_t argc, char **argv)
 {
-	config.txpower = -100;
+	set_config_txpower((int8_t)(-100));
 	shell_print(shell, "TX power : %d dBm", config.txpower);
 }
 #endif /* defined(RADIO_TXPOWER_TXPOWER_Neg100dBm) */
@@ -4506,7 +4512,7 @@ static int cmd_total_output_power_set(const struct shell *shell, size_t argc, ch
 		return -EINVAL;
 	}
 
-	config.txpower = (int8_t)power;
+	set_config_txpower((int8_t)((int8_t)power));
 
 	return 0;
 }
@@ -4640,7 +4646,7 @@ static int radio_cmd_init(void)
 	/* When front-end module is used, set output power to the front-end module
 	 * default output power.
 	 */
-	config.txpower = fem_default_tx_output_power_get();
+	set_config_txpower((int8_t)(fem_default_tx_output_power_get()));
 #endif /* CONFIG_RADIO_TEST_POWER_CONTROL_AUTOMATIC */
 
 	err = radio_test_init(&test_config);

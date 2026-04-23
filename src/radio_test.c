@@ -100,14 +100,29 @@ static uint8_t current_channel;
 
 static int16_t radio_get_rssi_dbm(void)
 {
-	/* Trigger a fresh RSSI sample and allow hardware to settle briefly. */
+	/* Trigger RSSISTART for ambient/monitor use and wait for measurement.
+	 * For per-packet RSSI, use radio_read_last_rx_rssi_dbm() instead, which
+	 * reads the hardware auto-updated RSSISAMPLE from packet reception. */
 	nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_RSSISTART);
-	k_busy_wait(8);
+	k_busy_wait(250);
 
 	/* RSSISAMPLE is encoded as positive magnitude of a negative dBm value. */
 	int16_t rssi_dbm = -(int16_t)nrf_radio_rssi_sample_get(NRF_RADIO);
 
 	/* If hardware reports invalid/sentinel values, expose as unavailable. */
+	if (rssi_dbm <= -127) {
+		return INT16_MIN;
+	}
+
+	return rssi_dbm;
+}
+
+/* Read RSSI of the most recently received packet.
+ * RSSISTART is triggered at ADDRESS event; by CRCOK the sample is ready. */
+static int16_t radio_read_last_rx_rssi_dbm(void)
+{
+	int16_t rssi_dbm = -(int16_t)nrf_radio_rssi_sample_get(NRF_RADIO);
+
 	if (rssi_dbm <= -127) {
 		return INT16_MIN;
 	}
@@ -191,7 +206,7 @@ static uint32_t proto_rsp_aux_sig;
 static bool proto_resume_rx_after_rsp;
 static uint8_t proto_rx_channel;
 static enum transmit_pattern proto_rx_pattern;
-static volatile int16_t proto_last_rx_rssi_dbm = INT16_MIN;
+static int8_t proto_response_txpower_dbm;
 
 static void proto_rsp_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(proto_rsp_work, proto_rsp_work_handler);
@@ -1204,19 +1219,11 @@ static void radio_rx(uint8_t mode, uint8_t channel, enum transmit_pattern patter
 	radio_channel_set(mode, channel);
 	proto_rx_channel = channel;
 	proto_rx_pattern = pattern;
-	proto_last_rx_rssi_dbm = INT16_MIN;
 
 	rx_packet_cnt = 0;
 
-	/* Enable ADDRESS and CRCOK interrupts so we can sample RSSI while payload
-	 * is actively being received and then process only valid packets.
-	 * but fail CRC (END without CRCOK). This helps with diagnosing why
-	 * no CRCOK events are observed.
-	 */
-	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK);
-#if defined(RADIO_INTENSET_ADDRESS_Msk) || defined(RADIO_INTENSET00_ADDRESS_Msk)
-	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_ADDRESS_MASK);
-#endif
+	nrf_radio_int_enable(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK |
+					NRF_RADIO_INT_ADDRESS_MASK);
 
 
 #if CONFIG_FEM
@@ -1561,21 +1568,20 @@ void radio_handler(const void *context)
 	const struct radio_test_config *config =
 		(const struct radio_test_config *) context;
 
-#if defined(RADIO_INTENSET_ADDRESS_Msk) || defined(RADIO_INTENSET00_ADDRESS_Msk)
+	/* Trigger RSSISTART at ADDRESS so RSSISAMPLE is populated by CRCOK. */
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_ADDRESS_MASK) &&
 	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_ADDRESS)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_ADDRESS);
-		proto_last_rx_rssi_dbm = radio_get_rssi_dbm();
+		nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_RSSISTART);
 	}
-#endif
 
 	if (nrf_radio_int_enable_check(NRF_RADIO, NRF_RADIO_INT_CRCOK_MASK) &&
 	    nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_CRCOK)) {
 		int16_t rssi_dbm;
 
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_CRCOK);
-		rssi_dbm = proto_last_rx_rssi_dbm;
-		proto_last_rx_rssi_dbm = INT16_MIN;
+		/* Read RSSISAMPLE — triggered at ADDRESS event, ready by CRCOK. */
+		rssi_dbm = radio_read_last_rx_rssi_dbm();
 
 #if CONFIG_HAS_HW_NRF_RADIO_IEEE802154
 		if (nrf_radio_mode_get(NRF_RADIO) == NRF_RADIO_MODE_IEEE802154_250KBIT) {
@@ -1612,6 +1618,12 @@ void radio_handler(const void *context)
 							peer->seen_discover_rsp = true;
 							proto_peer_profile_apply(peer, frame.aux_signature);
 						}
+					} else if (VERBOSE_LOGGING) {
+						printk("Ignoring DISCOVER_RSP from 0x%08X (role=%u dst=0x%08X local=0x%08X)\n",
+						       frame.src_signature,
+						       (uint32_t)proto_role,
+						       frame.dst_signature,
+						       proto_local_signature);
 					}
 					break;
 				case RADIO_PROTO_CMD_TEST_DATA:
@@ -1796,7 +1808,7 @@ static void proto_rsp_work_handler(struct k_work *work)
 
 	radio_disable();
 	radio_modulated_tx_carrier(NRF_RADIO_MODE_IEEE802154_250KBIT,
-				   0,
+				   proto_response_txpower_dbm,
 				   proto_rx_channel,
 				   TRANSMIT_PATTERN_RANDOM,
 				   1);
@@ -1805,6 +1817,11 @@ static void proto_rsp_work_handler(struct k_work *work)
 void radio_proto_set_signature(uint32_t signature)
 {
 	proto_local_signature = signature;
+}
+
+void radio_proto_set_response_txpower(int8_t txpower)
+{
+	proto_response_txpower_dbm = txpower;
 }
 
 void radio_proto_set_local_node_profile(enum radio_survey_node_type node_type,
