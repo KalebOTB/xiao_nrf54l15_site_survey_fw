@@ -47,9 +47,10 @@ Use one PC-connected board as controller/logger. Flash the same firmware to all 
 
 ```bash
 data_rate ieee802154_250Kbit
-start_channel 26
-end_channel 26
+start_channel 17
+end_channel 17
 node_aggregator off
+log_mode verbose
 output_power pos8dBm
 ```
 
@@ -59,8 +60,8 @@ output_power pos8dBm
 
 ```bash
 data_rate ieee802154_250Kbit
-start_channel 26
-end_channel 26
+start_channel 17
+end_channel 17
 node_mode coordinator
 node_type x
 node_aggregator on
@@ -74,7 +75,7 @@ output_power pos8dBm
 
 ```bash
 discover_list_clear
-proto_send_discover 200
+proto_send_discover 400
 discover_status
 ```
 

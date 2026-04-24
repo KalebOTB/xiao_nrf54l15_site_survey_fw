@@ -1601,15 +1601,16 @@ void radio_handler(const void *context)
 				switch (frame.cmd) {
 				case RADIO_PROTO_CMD_DISCOVER_REQ:
 					if (VERBOSE_LOGGING) printk("Received DISCOVER_REQ from 0x%08X\n", frame.src_signature);
+					radio_node_handle_proto_frame(&frame);
 					proto_discover_req_seen++;
 					radio_node_handle_discover_req(frame.src_signature,
 							      frame.dst_signature);
 					break;
 				case RADIO_PROTO_CMD_DISCOVER_RSP:
 					if (VERBOSE_LOGGING) printk("Received DISCOVER_RSP from 0x%08X\n", frame.src_signature);
+					radio_node_handle_proto_frame(&frame);
 					proto_discover_rsp_seen++;
-					if (proto_role == RADIO_PROTO_ROLE_TX &&
-					    proto_frame_for_me(frame.dst_signature)) {
+					if (proto_frame_for_me(frame.dst_signature)) {
 						struct radio_proto_peer *peer =
 							proto_find_or_add_peer(frame.src_signature);
 
@@ -1691,8 +1692,13 @@ void radio_handler(const void *context)
 					break;
 				case RADIO_PROTO_CMD_RELEASE_RSP:
 					if (VERBOSE_LOGGING) printk("Received RELEASE_RSP from 0x%08X\n", frame.src_signature);
-					if (proto_role == RADIO_PROTO_ROLE_TX &&
-					    proto_frame_for_me(frame.dst_signature)) {
+					radio_node_handle_proto_frame(&frame);
+					/* Accept unicast or broadcast RELEASE_RSP to handle weak-signal
+					 * relayed responses during discover_list_clear (when coordinator is in RX mode).
+					 */
+					if ((proto_role == RADIO_PROTO_ROLE_TX || proto_role == RADIO_PROTO_ROLE_RX) &&
+					    (proto_frame_for_me(frame.dst_signature) ||
+					     frame.dst_signature == RADIO_PROTO_BROADCAST_SIG)) {
 						struct radio_proto_peer *peer =
 							proto_find_or_add_peer(frame.src_signature);
 

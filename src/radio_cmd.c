@@ -167,6 +167,8 @@ static volatile bool rssi_monitor_cancel;
 static volatile bool rssi_monitor_active;
 static uint32_t rssi_monitor_interval_ms = 250u;
 
+
+
 static void rssi_monitor_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(rssi_monitor_work, rssi_monitor_work_handler);
 
@@ -311,6 +313,10 @@ static void proto_control_ack_reset(void)
 static bool relay_cmd_is_enabled(enum radio_proto_cmd cmd)
 {
 	switch (cmd) {
+	case RADIO_PROTO_CMD_DISCOVER_REQ:
+	case RADIO_PROTO_CMD_DISCOVER_RSP:
+	case RADIO_PROTO_CMD_RELEASE_REQ:
+	case RADIO_PROTO_CMD_RELEASE_RSP:
 	case RADIO_PROTO_CMD_CONTROL_ACK:
 	case RADIO_PROTO_CMD_SHARED_LIST_CLEAR:
 	case RADIO_PROTO_CMD_SHARED_LIST_ADD:
@@ -440,17 +446,16 @@ static int proto_send_frame_raw(const struct radio_proto_frame *frame)
 
 	radio_test_start(&test_config);
 
-	timeout_ms = 10000u;
+	timeout_ms = 300u;
 	sem_err = k_sem_take(&relay_tx_done_sem, K_MSEC(timeout_ms));
 
-	/* Keep relay nodes in RX behavior after forwarding so they can continue
-	 * to process and ACK control frames in the same control window.
+	/* Relay forwarding is a transient TX action. Always return to RX so
+	 * intermediate nodes keep listening/relaying without manual retune.
 	 */
-	proto_cfg.role = prev_role;
-	radio_proto_set_role(prev_role);
-	if (prev_role == RADIO_PROTO_ROLE_RX) {
-		proto_start_rx_continuous();
-	}
+	ARG_UNUSED(prev_role);
+	proto_cfg.role = RADIO_PROTO_ROLE_RX;
+	radio_proto_set_role(RADIO_PROTO_ROLE_RX);
+	proto_start_rx_continuous();
 
 	if (sem_err != 0) {
 		return -ETIMEDOUT;
@@ -466,17 +471,21 @@ static void relay_forward_work_handler(struct k_work *work)
 
 	ARG_UNUSED(work);
 
+	/* Wait for any in-progress response TX (e.g. DISCOVER_RSP) on this node
+	 * to complete before transmitting relay frames, avoiding radio contention.
+	 */
+	k_msleep(120);
+
 	while (relay_dequeue_frame(&frame)) {
 		if (proto_verbose_logging_enabled()) {
-			printk("RELAY_DIAG,fwd_start,cmd=%u,src=0x%08x,dst=0x%08x,aux=0x%08x,val=%u\n",
+			printk("RELAY_DIAG,fwd,cmd=%u,src=0x%08x,dst=0x%08x\n",
 			       (unsigned int)frame.cmd,
 			       frame.src_signature,
-			       frame.dst_signature,
-			       frame.aux_signature,
-			       (unsigned int)frame.value);
+			       frame.dst_signature);
 		}
 
 		err = proto_send_frame_raw(&frame);
+
 		if (proto_verbose_logging_enabled()) {
 			printk("RELAY_DIAG,fwd_done,cmd=%u,src=0x%08x,dst=0x%08x,err=%d\n",
 			       (unsigned int)frame.cmd,
@@ -2316,6 +2325,11 @@ static void node_button_work_handler(struct k_work *work)
 		return;
 	}
 
+	if (node_cfg.mode == RADIO_NODE_MODE_RECEIVER) {
+		/* Already provisioned. Ignore button presses to avoid disrupting RX/relay. */
+		return;
+	}
+
 	if (node_cfg.mode == RADIO_NODE_MODE_TEST_TX) {
 		printk("Button report ignored in test_tx mode\n");
 		return;
@@ -2443,8 +2457,16 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 		}
 
 		if (frame->dst_signature != proto_cfg.signature &&
-		    frame->dst_signature != RADIO_PROTO_BROADCAST_SIG) {
+		    (frame->dst_signature != RADIO_PROTO_BROADCAST_SIG ||
+		     frame->cmd == RADIO_PROTO_CMD_DISCOVER_REQ)) {
 			if (relay_enqueue_frame(frame)) {
+				if (proto_verbose_logging_enabled() &&
+				    frame->cmd == RADIO_PROTO_CMD_DISCOVER_REQ &&
+				    frame->dst_signature == RADIO_PROTO_BROADCAST_SIG) {
+					printk("RELAY_DIAG,discover_rebroadcast,enq,src=0x%08x,via=0x%08x\n",
+					       frame->src_signature,
+					       proto_cfg.signature);
+				}
 				if (proto_verbose_logging_enabled()) {
 					printk("RELAY_DIAG,enq,cmd=%u,src=0x%08x,dst=0x%08x,aux=0x%08x\n",
 					       (unsigned int)frame->cmd,
@@ -2552,9 +2574,14 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 			       frame->src_signature,
 			       node_mode_str((enum radio_node_mode)node_cfg.mode));
 		}
-		radio_proto_schedule_response(RADIO_PROTO_CMD_RELEASE_RSP,
-					     frame->src_signature,
-					     0u);
+		/* Broadcast RELEASE_RSP so intermediate nodes can relay it (important
+		 * for weak-signal nodes where unicast response may not reach coordinator).
+		 * Echo request aux so each retry attempt remains a unique relay frame.
+		 */
+		radio_proto_schedule_response_ext(RADIO_PROTO_CMD_RELEASE_RSP,
+						 RADIO_PROTO_BROADCAST_SIG,
+						 0u,
+						 frame->aux_signature);
 		k_work_reschedule(&node_release_work, K_MSEC(NODE_RELEASE_APPLY_DELAY_MS));
 		return;
 	}
@@ -2958,11 +2985,12 @@ static int cmd_discover_list_clear(const struct shell *shell, size_t argc, char 
 				shell_print(shell, "Release peer 0x%08x to unassigned", peer_sigs[i]);
 			}
 
-			if (proto_send_frame(shell,
-				    RADIO_PROTO_CMD_RELEASE_REQ,
-				    peer_sigs[i],
-				    0u,
-				    1u) != 0) {
+			if (proto_send_frame_ex(shell,
+				       RADIO_PROTO_CMD_RELEASE_REQ,
+				       peer_sigs[i],
+				       0u,
+				       (uint32_t)release_iteration,
+				       1u) != 0) {
 				continue;
 			}
 
