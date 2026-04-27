@@ -2878,6 +2878,7 @@ static int cmd_proto_rx_start(const struct shell *shell, size_t argc, char **arg
 static int cmd_proto_send_discover(const struct shell *shell, size_t argc, char **argv)
 {
 	uint32_t wait_ms = proto_cfg.discover_window_ms;
+	uint32_t rx_wait_ms;
 	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
 	uint8_t peer_count;
 	enum radio_node_mode prev_mode = (enum radio_node_mode)node_cfg.mode;
@@ -2901,17 +2902,37 @@ static int cmd_proto_send_discover(const struct shell *shell, size_t argc, char 
 	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 	proto_cfg.role = RADIO_PROTO_ROLE_TX;
 
-	if (proto_send_frame(shell,
-		RADIO_PROTO_CMD_DISCOVER_REQ,
-		0xFFFFFFFFu,
-		0,
-		1) != 0) {
+	if (proto_send_frame_ex(shell,
+				RADIO_PROTO_CMD_DISCOVER_REQ,
+				0xFFFFFFFFu,
+				0u,
+				0u,
+				1u) != 0) {
 		err = -EIO;
 		goto out;
 	}
 
+	/* Send a second discover broadcast with a different aux token so relay
+	 * duplicate suppression treats it as a fresh attempt.
+	 */
+	k_msleep(30);
+	if (proto_send_frame_ex(shell,
+				RADIO_PROTO_CMD_DISCOVER_REQ,
+				0xFFFFFFFFu,
+				0u,
+				1u,
+				1u) != 0) {
+		err = -EIO;
+		goto out;
+	}
+
+	/* Add relay guard time so two-hop responses can still arrive inside a
+	 * single discover command at lower TX powers.
+	 */
+	rx_wait_ms = wait_ms + 250u;
+
 	k_msleep(2);
-	proto_rx_window(wait_ms);
+	proto_rx_window(rx_wait_ms);
 	peer_count = radio_proto_get_peer_signatures(peer_sigs, ARRAY_SIZE(peer_sigs));
 	if (proto_verbose_logging_enabled()) {
 		shell_print(shell, "DISCOVER complete: %u peers", peer_count);
