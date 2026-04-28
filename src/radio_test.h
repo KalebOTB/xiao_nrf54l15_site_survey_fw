@@ -248,6 +248,7 @@ enum radio_proto_cmd {
 	RADIO_PROTO_CMD_SHARED_LIST_ADD,
 	RADIO_PROTO_CMD_TEST_START,
 	RADIO_PROTO_CMD_TEST_END,
+	RADIO_PROTO_CMD_SET_CHANNEL,
 };
 
 struct radio_proto_frame {

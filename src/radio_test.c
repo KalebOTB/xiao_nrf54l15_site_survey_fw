@@ -512,8 +512,8 @@ static void radio_power_set(nrf_radio_mode_t mode, uint8_t channel, int8_t power
 	nrf_radio_txpower_set(NRF_RADIO, dbm_to_nrf_radio_txpower(radio_power));
 
 	if (!sweep_processing) {
-		printk("Requested tx output power: %" PRIi8 " dBm\n", power);
-		printk("Tx output power set to: %" PRIi8 " dBm\n", output_power);
+		if (VERBOSE_LOGGING) printk("Requested tx output power: %" PRIi8 " dBm\n", power);
+		if (VERBOSE_LOGGING) printk("Tx output power set to: %" PRIi8 " dBm\n", output_power);
 	}
 }
 
@@ -1591,9 +1591,9 @@ void radio_handler(const void *context)
 
 			if (frame_ok) {
 				if (rssi_dbm == INT16_MIN) {
-					printk("RX_RSSI,src=0x%08X,NA\n", frame.src_signature);
+					if (VERBOSE_LOGGING) printk("RX_RSSI,src=0x%08X,NA\n", frame.src_signature);
 				} else {
-					printk("RX_RSSI,src=0x%08X,%d dBm\n", frame.src_signature, rssi_dbm);
+					if (VERBOSE_LOGGING) printk("RX_RSSI,src=0x%08X,%d dBm\n", frame.src_signature, rssi_dbm);
 				}
 				rx_packet_cnt++;
 				radio_node_note_proto_frame_activity(frame.src_signature);
@@ -1726,6 +1726,7 @@ void radio_handler(const void *context)
 				case RADIO_PROTO_CMD_TEST_END:
 				case RADIO_PROTO_CMD_PROVISION_REQ:
 				case RADIO_PROTO_CMD_PROVISION_RSP:
+				case RADIO_PROTO_CMD_SET_CHANNEL:
 					radio_node_handle_proto_frame(&frame);
 					break;
 				default:
@@ -1770,6 +1771,10 @@ void radio_handler(const void *context)
 		nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_PHYEND)) {
 		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_PHYEND);
 		if (proto_resume_rx_after_rsp) {
+			radio_node_handle_proto_response_complete(proto_rsp_cmd,
+							 proto_rsp_dst_sig,
+							 proto_rsp_value,
+							 proto_rsp_aux_sig);
 			proto_resume_rx_after_rsp = false;
 			radio_rx(NRF_RADIO_MODE_IEEE802154_250KBIT,
 				 proto_rx_channel,
