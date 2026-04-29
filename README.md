@@ -65,8 +65,6 @@ discover_list_clear
 proto_send_discover 400
 discover_status
 ```
-start_channel 15
-end_channel 15
 
 4. *(Optional)* Change channel on all nodes simultaneously
 
@@ -76,6 +74,8 @@ If you need to move all nodes to a different channel after discovery, use `proto
 proto_set_channel 15
 ```
 
+> `proto_set_channel` now emits `ACK_START,proto_set_channel` and `ACK_END,proto_set_channel,OK|ERR` like the other coordinated commands.
+>
 > The coordinator only switches channels after all peers confirm. If any peer fails to ACK, the coordinator stays on the original channel.
 
 5. Run full PER flow
@@ -100,7 +100,7 @@ data_rate ieee802154_250Kbit
 start_channel 15
 ```
 
-Valid IEEE channels: 11-26.
+Valid IEEE channels: 11-26. If you want to move an already-discovered test group together, prefer `proto_set_channel` over manually changing each node.
 
 ## Logging Modes
 
@@ -143,7 +143,7 @@ During debug builds or when verbose protocol diagnostics are enabled, additional
 
 ## Notes
 
-- Boards boot in IEEE 802.15.4 mode on channel 15.
+- Boards boot in IEEE 802.15.4 mode on channel 17.
 - After reset/power cycle, nodes start in unassigned mode and should be rediscovered.
 - node_type and node_aggregator are persisted in non-volatile settings.
 - `proto_test_run` shares the discovered-node list to all discovered nodes before rotating broadcasters.

@@ -1641,10 +1641,27 @@ void radio_handler(const void *context)
 					proto_per_req_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature)) {
+						printk("PER_DIAG,rsp_sched,from=0x%08X,dst=0x%08X,local=0x%08X,role=%u,active=%u,broadcaster=0x%08X,rx=%u\n",
+						       frame.src_signature,
+						       frame.dst_signature,
+						       proto_local_signature,
+						       (uint32_t)proto_role,
+						       proto_test_session_active ? 1u : 0u,
+						       proto_test_session_broadcaster,
+						       (unsigned int)proto_local_test_data_rx);
 						radio_proto_schedule_response(RADIO_PROTO_CMD_PER_RSP,
 								      frame.src_signature,
 								      (uint16_t)MIN(proto_local_test_data_rx,
 										  UINT16_MAX));
+					} else if (proto_frame_for_me(frame.dst_signature)) {
+						printk("PER_DIAG,ignored,from=0x%08X,dst=0x%08X,local=0x%08X,role=%u,active=%u,broadcaster=0x%08X,rx=%u\n",
+						       frame.src_signature,
+						       frame.dst_signature,
+						       proto_local_signature,
+						       (uint32_t)proto_role,
+						       proto_test_session_active ? 1u : 0u,
+						       proto_test_session_broadcaster,
+						       (unsigned int)proto_local_test_data_rx);
 					}
 					break;
 				case RADIO_PROTO_CMD_PER_RSP:
@@ -1666,12 +1683,30 @@ void radio_handler(const void *context)
 					if (VERBOSE_LOGGING) printk("Received CLEAR_PER_REQ from 0x%08X\n", frame.src_signature);
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature)) {
+						printk("CLEAR_DIAG,ack_sched,from=0x%08X,dst=0x%08X,local=0x%08X,role=%u,active=%u,broadcaster=0x%08X,rx=%u\n",
+						       frame.src_signature,
+						       frame.dst_signature,
+						       proto_local_signature,
+						       (uint32_t)proto_role,
+						       proto_test_session_active ? 1u : 0u,
+						       proto_test_session_broadcaster,
+						       (unsigned int)proto_local_test_data_rx);
 						proto_test_session_active = false;
 						proto_test_session_broadcaster = 0u;
 						proto_local_test_data_rx = 0;
-						radio_proto_schedule_response(RADIO_PROTO_CMD_CLEAR_PER_RSP,
-									      frame.src_signature,
-									      0);
+						radio_proto_schedule_response_ext(RADIO_PROTO_CMD_CONTROL_ACK,
+										  frame.src_signature,
+										  RADIO_PROTO_CMD_CLEAR_PER_REQ,
+										  frame.aux_signature);
+					} else if (proto_frame_for_me(frame.dst_signature)) {
+						printk("CLEAR_DIAG,ignored,from=0x%08X,dst=0x%08X,local=0x%08X,role=%u,active=%u,broadcaster=0x%08X,rx=%u\n",
+						       frame.src_signature,
+						       frame.dst_signature,
+						       proto_local_signature,
+						       (uint32_t)proto_role,
+						       proto_test_session_active ? 1u : 0u,
+						       proto_test_session_broadcaster,
+						       (unsigned int)proto_local_test_data_rx);
 					}
 					break;
 				case RADIO_PROTO_CMD_CLEAR_PER_RSP:
