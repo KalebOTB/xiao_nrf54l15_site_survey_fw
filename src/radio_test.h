@@ -29,6 +29,7 @@
 #define RADIO_MAX_PAYLOAD_LEN	256
 /** IEEE 802.15.4 maximum payload length. */
 #define IEEE_MAX_PAYLOAD_LEN	127
+#define RADIO_PROTO_HEADER_SIZE 20u
 #define RADIO_PROTO_BROADCAST_SIG 0xFFFFFFFFu
 /** IEEE 802.15.4 minimum channel. */
 #define IEEE_MIN_CHANNEL	11
@@ -258,6 +259,7 @@ struct radio_proto_frame {
 	uint32_t dst_signature;
 	uint32_t aux_signature;
 	uint16_t value;
+	uint8_t payload_len;
 };
 
 struct radio_proto_peer {
@@ -347,6 +349,11 @@ int radio_proto_prepare_tx(enum radio_proto_cmd cmd, uint32_t dst_signature, uin
 int radio_proto_prepare_tx_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
 			       uint16_t value, uint32_t aux_signature);
 
+int radio_proto_prepare_tx_ext_sized(enum radio_proto_cmd cmd, uint32_t dst_signature,
+				     uint16_t value, uint32_t aux_signature,
+				     uint8_t payload_len_field,
+				     uint8_t frame_payload_len);
+
 int radio_proto_prepare_tx_raw(enum radio_proto_cmd cmd,
 			       uint8_t flags,
 			       uint32_t src_signature,
@@ -354,11 +361,26 @@ int radio_proto_prepare_tx_raw(enum radio_proto_cmd cmd,
 			       uint16_t value,
 			       uint32_t aux_signature);
 
+int radio_proto_prepare_tx_raw_sized(enum radio_proto_cmd cmd,
+				     uint8_t flags,
+				     uint32_t src_signature,
+				     uint32_t dst_signature,
+				     uint16_t value,
+				     uint32_t aux_signature,
+				     uint8_t payload_len_field,
+				     uint8_t frame_payload_len);
+
 void radio_proto_schedule_response(enum radio_proto_cmd cmd, uint32_t dst_signature,
 				       uint16_t value);
 
 void radio_proto_schedule_response_ext(enum radio_proto_cmd cmd, uint32_t dst_signature,
 				       uint16_t value, uint32_t aux_signature);
+
+void radio_proto_schedule_response_raw(enum radio_proto_cmd cmd,
+				      uint8_t flags,
+				      uint32_t dst_signature,
+				      uint16_t value,
+				      uint32_t aux_signature);
 
 void radio_proto_get_status(struct radio_proto_status *status);
 

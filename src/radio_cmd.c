@@ -112,6 +112,7 @@ struct radio_proto_cli_config {
 	uint32_t per_wait_ms;
 	uint32_t provision_wait_ms;
 	uint32_t test_packets;
+	uint32_t test_payload_len;
 };
 
 static struct radio_proto_cli_config proto_cfg = {
@@ -121,6 +122,7 @@ static struct radio_proto_cli_config proto_cfg = {
 	.per_wait_ms = 80,
 	.provision_wait_ms = 500,
 	.test_packets = 100,
+	.test_payload_len = RADIO_PROTO_HEADER_SIZE,
 };
 
 #define RADIO_NODE_SETTINGS_NAME "radio_node"
@@ -174,23 +176,28 @@ static uint32_t rssi_monitor_interval_ms = 250u;
 static void rssi_monitor_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(rssi_monitor_work, rssi_monitor_work_handler);
 
+#define KALEB_TEST_KNOB 30u
 #define NODE_RELEASE_APPLY_DELAY_MS 200
 #define NODE_SETTINGS_SAVE_DELAY_MS 300
 #define RSSI_MONITOR_INTERVAL_MIN_MS 1u
-#define REMOTE_TEST_REPORT_RETRY_MAX 40
-#define REMOTE_TEST_DONE_RETRY_MAX 40
+#define REMOTE_TEST_REPORT_RETRY_MAX KALEB_TEST_KNOB
+#define REMOTE_TEST_DONE_RETRY_MAX KALEB_TEST_KNOB
 #define REMOTE_TEST_DELEGATE_TIMEOUT_MIN_MS 4000u
 #define PRETEST_CLEAR_RETRY_MAX 40u
-#define REMOTE_TEST_REQ_RETRY_MAX 40u
+#define REMOTE_TEST_REQ_RETRY_MAX KALEB_TEST_KNOB
 #define REMOTE_TEST_REQ_ACK_WAIT_MIN_MS 120u
-#define REMOTE_TEST_WORK_START_DELAY_MS 70u
+#define REMOTE_TEST_WORK_START_DELAY_MIN_MS 200u
+#define REMOTE_TEST_REQ_ACK_RECOVERY_MARGIN_MS 80u
 #define REMOTE_TEST_DONE_DRAIN_MIN_MS 300u
 #define REMOTE_TEST_DISCOVER_ROUNDS 2u
-#define PROTO_PER_PHASE_MAX_ROUNDS 40u
-#define CONTROL_ACK_RETRY_MAX 40u
-#define CONTROL_ACK_WAIT_MIN_MS 300u
+#define PROTO_PER_PHASE_MAX_ROUNDS KALEB_TEST_KNOB
+#define CONTROL_ACK_RETRY_MAX KALEB_TEST_KNOB
+#define CONTROL_ACK_WAIT_MIN_MS 200u
 #define TEST_START_SETTLE_MS 60u
 #define SHARED_TEST_LIST_MAX (RADIO_PROTO_MAX_PEERS + 1u)
+
+#define REMOTE_TEST_REPORT_STATUS_OK 0u
+#define REMOTE_TEST_REPORT_STATUS_PEER_TIMEOUT 1u
 
 #define REMOTE_TEST_WORKQ_STACK_SIZE 8192
 K_THREAD_STACK_DEFINE(remote_test_workq_stack, REMOTE_TEST_WORKQ_STACK_SIZE);
@@ -201,6 +208,8 @@ struct remote_test_request_state {
 	uint16_t packets;
 	uint16_t wait_ms;
 	uint16_t retry_ms;
+	uint8_t test_payload_len;
+	uint8_t round_token;
 	bool pending;
 	bool busy;
 };
@@ -211,6 +220,7 @@ struct remote_test_monitor_state {
 	volatile bool done;
 	volatile uint32_t delegate_signature;
 	volatile uint16_t expected_packets;
+	volatile uint8_t round_token;
 	volatile uint16_t reported_peers;
 	volatile uint32_t last_activity_ticks;
 	uint32_t reported_peer_sigs[RADIO_PROTO_MAX_PEERS];
@@ -232,6 +242,7 @@ static volatile bool control_ack_received;
 static volatile uint32_t control_ack_sender;
 static volatile uint16_t control_ack_cmd;
 static volatile uint32_t control_ack_context;
+static uint8_t remote_test_round_token_counter;
 
 
 void radio_node_note_proto_frame_activity(uint32_t src_signature)
@@ -412,8 +423,15 @@ static void proto_clear_counters_before_test(const struct shell *shell,
 static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 				 uint32_t wait_ms, uint32_t retry_ms);
 static int proto_round_robin_run_internal(const struct shell *shell, uint32_t packets,
-					   uint32_t wait_ms, uint32_t retry_ms);
+				   uint32_t wait_ms, uint32_t retry_ms,
+				   uint32_t payload_len);
 static const char *node_mode_str(enum radio_node_mode mode);
+
+static bool proto_test_payload_len_valid(uint32_t payload_len)
+{
+	return payload_len >= RADIO_PROTO_HEADER_SIZE &&
+	       payload_len <= IEEE_MAX_PAYLOAD_LEN;
+}
 
 static bool node_is_type_valid(uint8_t node_type)
 {
@@ -465,22 +483,54 @@ static void proto_ack_end(const struct shell *shell, const char *command, int er
 static void proto_emit_per_report(uint32_t rx_signature, uint32_t tx_signature,
 				  uint16_t sent_packets, uint16_t recv_packets)
 {
-	/* PER_REPORT,<tx_serial>,<rx_serial>,<total_sent>,<total_received> */
-	printk("PER_REPORT,0x%08x,0x%08x,%u,%u\n",
+	/* PER_REPORT,<tx_serial>,<rx_serial>,<total_sent>,<total_received>,<payload_len>,<channel> */
+	printk("PER_REPORT,0x%08x,0x%08x,%u,%u,%u,%u\n",
 	       tx_signature,
 	       rx_signature,
 	       (unsigned int)sent_packets,
-	       (unsigned int)recv_packets);
+	       (unsigned int)recv_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
 }
 
 static void proto_emit_per_timeout(uint32_t rx_signature, uint32_t tx_signature,
 				   uint16_t sent_packets)
 {
-	/* PER_REPORT_TIMEOUT,<tx_serial>,<rx_serial>,<total_sent> */
-	printk("PER_REPORT_TIMEOUT,0x%08x,0x%08x,%u\n",
+	/* Emit a normalized report row for parsers that expect the PER_REPORT shape. */
+	printk("PER_REPORT,0x%08x,0x%08x,%u,-1,%u,%u\n",
 	       tx_signature,
 	       rx_signature,
-	       (unsigned int)sent_packets);
+	       (unsigned int)sent_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
+
+	/* PER_REPORT_TIMEOUT,<tx_serial>,<rx_serial>,<total_sent>,<payload_len>,<channel> */
+	printk("PER_REPORT_TIMEOUT,0x%08x,0x%08x,%u,%u,%u\n",
+	       tx_signature,
+	       rx_signature,
+	       (unsigned int)sent_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
+}
+
+static void proto_emit_per_unstarted(uint32_t rx_signature, uint32_t tx_signature,
+				     uint16_t sent_packets)
+{
+	/* -2 denotes an untested link because the delegate round never started. */
+	printk("PER_REPORT,0x%08x,0x%08x,%u,-2,%u,%u\n",
+	       tx_signature,
+	       rx_signature,
+	       (unsigned int)sent_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
+
+	/* Preserve the timeout-shaped companion row for missing delegated starts. */
+	printk("PER_REPORT_TIMEOUT,0x%08x,0x%08x,%u,%u,%u\n",
+	       tx_signature,
+	       rx_signature,
+	       (unsigned int)sent_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
 }
 
 static bool proto_verbose_logging_enabled(void)
@@ -542,6 +592,29 @@ static uint16_t proto_unpack_u16_low(uint32_t packed)
 static uint16_t proto_unpack_u16_high(uint32_t packed)
 {
 	return (uint16_t)(packed >> 16);
+}
+
+static uint32_t remote_test_work_start_delay_ms(uint16_t wait_ms)
+{
+	uint32_t req_ack_wait_ms = wait_ms > REMOTE_TEST_REQ_ACK_WAIT_MIN_MS ?
+		(uint32_t)wait_ms : REMOTE_TEST_REQ_ACK_WAIT_MIN_MS;
+	uint32_t start_delay_ms = req_ack_wait_ms + REMOTE_TEST_REQ_ACK_RECOVERY_MARGIN_MS;
+
+	if (start_delay_ms < REMOTE_TEST_WORK_START_DELAY_MIN_MS) {
+		start_delay_ms = REMOTE_TEST_WORK_START_DELAY_MIN_MS;
+	}
+
+	return start_delay_ms;
+}
+
+static uint8_t proto_next_remote_round_token(void)
+{
+	remote_test_round_token_counter++;
+	if (remote_test_round_token_counter == 0u) {
+		remote_test_round_token_counter++;
+	}
+
+	return remote_test_round_token_counter;
 }
 
 static void node_apply_mode(enum radio_node_mode mode)
@@ -1839,36 +1912,15 @@ static bool proto_require_ieee_mode(const struct shell *shell)
 	return true;
 }
 
-static int proto_send_frame_ex(const struct shell *shell, enum radio_proto_cmd cmd,
-			       uint32_t dst_signature, uint16_t value,
-			       uint32_t aux_signature, uint32_t packets_num)
+static int proto_transmit_prepared_frame(const struct shell *shell,
+				 enum radio_proto_cmd cmd,
+				 uint32_t dst_signature,
+				 uint16_t value,
+				 uint32_t aux_signature,
+				 uint32_t packets_num)
 {
-	int err;
 	int sem_err;
 	uint32_t timeout_ms;
-
-	if (!proto_require_ieee_mode(shell)) {
-		return -EINVAL;
-	}
-
-	if (packets_num == 0) {
-		if (shell != NULL) {
-			shell_error(shell, "packets_num must be greater than zero");
-		} else {
-			printk("packets_num must be greater than zero\n");
-		}
-		return -EINVAL;
-	}
-
-	err = radio_proto_prepare_tx_ext(cmd, dst_signature, value, aux_signature);
-	if (err) {
-		if (shell != NULL) {
-			shell_error(shell, "Failed to prepare protocol frame (%d)", err);
-		} else {
-			printk("Failed to prepare protocol frame (%d)\n", err);
-		}
-		return err;
-	}
 
 	memset(&test_config, 0, sizeof(test_config));
 	test_config.mode = config.mode;
@@ -1945,6 +1997,157 @@ static int proto_send_frame_ex(const struct shell *shell, enum radio_proto_cmd c
 	}
 
 	return 0;
+}
+
+static int proto_send_frame_ex(const struct shell *shell, enum radio_proto_cmd cmd,
+			       uint32_t dst_signature, uint16_t value,
+			       uint32_t aux_signature, uint32_t packets_num)
+{
+	int err;
+
+	if (!proto_require_ieee_mode(shell)) {
+		return -EINVAL;
+	}
+
+	if (packets_num == 0) {
+		if (shell != NULL) {
+			shell_error(shell, "packets_num must be greater than zero");
+		} else {
+			printk("packets_num must be greater than zero\n");
+		}
+		return -EINVAL;
+	}
+
+	err = radio_proto_prepare_tx_ext(cmd, dst_signature, value, aux_signature);
+	if (err) {
+		if (shell != NULL) {
+			shell_error(shell, "Failed to prepare protocol frame (%d)", err);
+		} else {
+			printk("Failed to prepare protocol frame (%d)\n", err);
+		}
+		return err;
+	}
+
+	return proto_transmit_prepared_frame(shell, cmd, dst_signature, value, aux_signature, packets_num);
+}
+
+static int proto_send_test_data_frame(const struct shell *shell,
+				      uint32_t dst_signature,
+				      uint16_t packets,
+				      uint32_t payload_len,
+				      uint32_t packets_num)
+{
+	int err;
+
+	if (!proto_require_ieee_mode(shell)) {
+		return -EINVAL;
+	}
+
+	if (packets_num == 0) {
+		if (shell != NULL) {
+			shell_error(shell, "packets_num must be greater than zero");
+		} else {
+			printk("packets_num must be greater than zero\n");
+		}
+		return -EINVAL;
+	}
+
+	if (!proto_test_payload_len_valid(payload_len)) {
+		if (shell != NULL) {
+			shell_error(shell, "payload_len must be in range %u..%u",
+				    (unsigned int)RADIO_PROTO_HEADER_SIZE,
+				    (unsigned int)IEEE_MAX_PAYLOAD_LEN);
+		} else {
+			printk("payload_len must be in range %u..%u\n",
+			       (unsigned int)RADIO_PROTO_HEADER_SIZE,
+			       (unsigned int)IEEE_MAX_PAYLOAD_LEN);
+		}
+		return -EINVAL;
+	}
+
+	err = radio_proto_prepare_tx_ext_sized(RADIO_PROTO_CMD_TEST_DATA,
+					      dst_signature,
+					      packets,
+					      0u,
+					      (uint8_t)payload_len,
+					      (uint8_t)payload_len);
+	if (err) {
+		if (shell != NULL) {
+			shell_error(shell, "Failed to prepare protocol frame (%d)", err);
+		} else {
+			printk("Failed to prepare protocol frame (%d)\n", err);
+		}
+		return err;
+	}
+
+	return proto_transmit_prepared_frame(shell,
+					     RADIO_PROTO_CMD_TEST_DATA,
+					     dst_signature,
+					     packets,
+					     0u,
+					     packets_num);
+}
+
+static int proto_send_frame_raw_param_ex(const struct shell *shell,
+					 enum radio_proto_cmd cmd,
+					 uint8_t flags,
+					 uint32_t dst_signature,
+					 uint16_t value,
+					 uint32_t aux_signature,
+					 uint8_t payload_len_field,
+					 uint32_t packets_num)
+{
+	int err;
+
+	if (!proto_require_ieee_mode(shell)) {
+		return -EINVAL;
+	}
+
+	if (packets_num == 0) {
+		if (shell != NULL) {
+			shell_error(shell, "packets_num must be greater than zero");
+		} else {
+			printk("packets_num must be greater than zero\n");
+		}
+		return -EINVAL;
+	}
+
+	err = radio_proto_prepare_tx_raw_sized(cmd,
+					      flags,
+					      proto_cfg.signature,
+					      dst_signature,
+					      value,
+					      aux_signature,
+					      payload_len_field,
+					      0u);
+	if (err) {
+		if (shell != NULL) {
+			shell_error(shell, "Failed to prepare raw protocol frame (%d)", err);
+		} else {
+			printk("Failed to prepare raw protocol frame (%d)\n", err);
+		}
+		return err;
+	}
+
+	return proto_transmit_prepared_frame(shell, cmd, dst_signature, value, aux_signature, packets_num);
+}
+
+static int proto_send_frame_raw_ex(const struct shell *shell,
+				   enum radio_proto_cmd cmd,
+				   uint8_t flags,
+				   uint32_t dst_signature,
+				   uint16_t value,
+				   uint32_t aux_signature,
+				   uint32_t packets_num)
+{
+	return proto_send_frame_raw_param_ex(shell,
+					 cmd,
+					 flags,
+					 dst_signature,
+					 value,
+					 aux_signature,
+					 0u,
+					 packets_num);
 }
 
 static int proto_send_frame(const struct shell *shell, enum radio_proto_cmd cmd,
@@ -2457,12 +2660,22 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	    node_cfg.mode != RADIO_NODE_MODE_TEST_TX &&
 	    frame->dst_signature == proto_cfg.signature) {
 		if (remote_test_request.busy || remote_test_request.pending) {
-			radio_proto_schedule_response(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
-					     frame->src_signature,
-					     frame->value);
-			if (proto_verbose_logging_enabled()) {
-				printk("Remote test request already active; acked duplicate from 0x%08x\n",
-				       frame->src_signature);
+			if (frame->src_signature == remote_test_request.controller_signature &&
+			    frame->flags == remote_test_request.round_token) {
+				radio_proto_schedule_response_raw(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
+							 frame->flags,
+							 frame->src_signature,
+							 frame->value,
+							 0u);
+				if (proto_verbose_logging_enabled()) {
+					printk("Remote test request already active; acked duplicate from 0x%08x\n",
+					       frame->src_signature);
+				}
+			} else if (proto_verbose_logging_enabled()) {
+				printk("Ignored conflicting remote test request from 0x%08x token=%u active_token=%u\n",
+				       frame->src_signature,
+				       (unsigned int)frame->flags,
+				       (unsigned int)remote_test_request.round_token);
 			}
 			return;
 		}
@@ -2471,19 +2684,26 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 		remote_test_request.packets = frame->value;
 		remote_test_request.wait_ms = proto_unpack_u16_low(frame->aux_signature);
 		remote_test_request.retry_ms = proto_unpack_u16_high(frame->aux_signature);
+		remote_test_request.test_payload_len = frame->payload_len;
+		remote_test_request.round_token = frame->flags;
 		if (remote_test_request.wait_ms == 0u) {
 			remote_test_request.wait_ms = (uint16_t)proto_cfg.per_wait_ms;
 		}
 		if (remote_test_request.retry_ms == 0u) {
 			remote_test_request.retry_ms = remote_test_request.wait_ms;
 		}
+		if (!proto_test_payload_len_valid(remote_test_request.test_payload_len)) {
+			remote_test_request.test_payload_len = (uint8_t)proto_cfg.test_payload_len;
+		}
 		remote_test_request.pending = true;
-		radio_proto_schedule_response(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
-					     frame->src_signature,
-					     frame->value);
+		radio_proto_schedule_response_raw(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
+						 frame->flags,
+						 frame->src_signature,
+						 frame->value,
+						 0u);
 		k_work_reschedule_for_queue(&remote_test_workq,
 					  &remote_test_work,
-					  K_MSEC(REMOTE_TEST_WORK_START_DELAY_MS));
+					  K_MSEC(remote_test_work_start_delay_ms(remote_test_request.wait_ms)));
 		if (proto_verbose_logging_enabled()) {
 			printk("Remote test request accepted from 0x%08x\n", frame->src_signature);
 		}
@@ -2493,6 +2713,7 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK &&
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_monitor.active &&
+	    frame->flags == remote_test_monitor.round_token &&
 	    frame->src_signature == remote_test_monitor.delegate_signature) {
 		remote_test_req_ack_packets = frame->value;
 		remote_test_req_ack_received = true;
@@ -2503,17 +2724,25 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_monitor.active &&
 	    remote_test_monitor.req_acked &&
+	    frame->flags == remote_test_monitor.round_token &&
 	    frame->src_signature == remote_test_monitor.delegate_signature) {
 		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
 		if (remote_test_monitor_mark_peer_reported(frame->aux_signature)) {
 			remote_test_monitor.reported_peers++;
-			proto_emit_per_report(frame->aux_signature,
-					      frame->src_signature,
-					      remote_test_monitor.expected_packets,
-					      frame->value);
+			if (frame->payload_len == REMOTE_TEST_REPORT_STATUS_PEER_TIMEOUT) {
+				proto_emit_per_timeout(frame->aux_signature,
+						     frame->src_signature,
+						     remote_test_monitor.expected_packets);
+			} else {
+				proto_emit_per_report(frame->aux_signature,
+						      frame->src_signature,
+						      remote_test_monitor.expected_packets,
+						      frame->value);
+			}
 		}
 
-		radio_proto_schedule_response_ext(RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK,
+		radio_proto_schedule_response_raw(RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK,
+						 frame->flags,
 						 frame->src_signature,
 						 frame->value,
 						 frame->aux_signature);
@@ -2524,14 +2753,19 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_monitor.active &&
 	    remote_test_monitor.req_acked &&
+	    frame->flags == remote_test_monitor.round_token &&
 	    frame->src_signature == remote_test_monitor.delegate_signature) {
+		bool first_done = !remote_test_monitor.done;
+
 		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
 		remote_test_monitor.reported_peers = remote_test_monitor.reported_peer_count;
 		remote_test_monitor.done = true;
-		radio_proto_schedule_response(RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK,
-					     frame->src_signature,
-					     remote_test_monitor.reported_peers);
-		if (proto_verbose_logging_enabled()) {
+		radio_proto_schedule_response_raw(RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK,
+						 frame->flags,
+						 frame->src_signature,
+						 remote_test_monitor.reported_peers,
+						 0u);
+		if (first_done && proto_verbose_logging_enabled()) {
 			printk("Remote test finished: delegate=0x%08x reports=%u\n",
 			       frame->src_signature,
 			       remote_test_monitor.reported_peers);
@@ -2542,6 +2776,7 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REPORT_ACK &&
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_request.busy &&
+	    frame->flags == remote_test_request.round_token &&
 	    frame->src_signature == remote_test_request.controller_signature) {
 		remote_test_report_ack_peer = frame->aux_signature;
 		remote_test_report_ack_value = frame->value;
@@ -2552,6 +2787,7 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_DONE_ACK &&
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_request.busy &&
+	    frame->flags == remote_test_request.round_token &&
 	    frame->src_signature == remote_test_request.controller_signature) {
 		remote_test_done_ack_reports = frame->value;
 		remote_test_done_ack_received = true;
@@ -3042,14 +3278,18 @@ out:
 static int cmd_proto_send_test_data(const struct shell *shell, size_t argc, char **argv)
 {
 	uint32_t packets = proto_cfg.test_packets;
+	uint32_t payload_len = proto_cfg.test_payload_len;
 
-	if (argc > 2) {
-		shell_error(shell, "Usage: proto_send_test_data [packets]");
+	if (argc > 3) {
+		shell_error(shell, "Usage: proto_send_test_data [packets] [payload_len]");
 		return -EINVAL;
 	}
 
 	if (argc == 2) {
 		packets = strtoul(argv[1], NULL, 0);
+	}
+	if (argc == 3) {
+		payload_len = strtoul(argv[2], NULL, 0);
 	}
 
 	if (packets == 0 || packets > UINT16_MAX) {
@@ -3057,15 +3297,23 @@ static int cmd_proto_send_test_data(const struct shell *shell, size_t argc, char
 		return -EINVAL;
 	}
 
+	if (!proto_test_payload_len_valid(payload_len)) {
+		shell_error(shell, "payload_len must be in range %u..%u",
+			    (unsigned int)RADIO_PROTO_HEADER_SIZE,
+			    (unsigned int)IEEE_MAX_PAYLOAD_LEN);
+		return -EINVAL;
+	}
+
 	proto_cfg.test_packets = packets;
+	proto_cfg.test_payload_len = payload_len;
 	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 	proto_cfg.role = RADIO_PROTO_ROLE_TX;
 
-	return proto_send_frame(shell,
-		RADIO_PROTO_CMD_TEST_DATA,
-		0xFFFFFFFFu,
-		(uint16_t)packets,
-		packets);
+	return proto_send_test_data_frame(shell,
+					 RADIO_PROTO_BROADCAST_SIG,
+					 (uint16_t)packets,
+					 payload_len,
+					 packets);
 }
 
 static int cmd_proto_send_per_req(const struct shell *shell, size_t argc, char **argv)
@@ -3120,6 +3368,9 @@ static int cmd_proto_send_per_req(const struct shell *shell, size_t argc, char *
 	}
 
 	if (!got_rsp) {
+		proto_emit_per_timeout(dst_sig,
+				      proto_cfg.signature,
+				      (uint16_t)expected);
 		shell_print(shell, "No PER response from 0x%08x", dst_sig);
 	}
 
@@ -3251,6 +3502,37 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 		}
 	}
 
+	if (!proto_collect_per_cancel && !all_per_done) {
+		radio_proto_get_status(&status);
+
+		for (uint8_t i = 0; i < peer_count; i++) {
+			bool got_rsp = false;
+
+			for (uint8_t p = 0; p < status.peer_count; p++) {
+				if (status.peers[p].signature == peer_sigs[i] &&
+				    status.peers[p].seen_per_rsp) {
+					got_rsp = true;
+					break;
+				}
+			}
+
+			if (got_rsp) {
+				continue;
+			}
+
+			proto_emit_per_timeout(peer_sigs[i],
+					      proto_cfg.signature,
+					      (uint16_t)expected);
+
+			if (proto_verbose_logging_enabled() && shell != NULL) {
+				shell_print(shell,
+					   "PER collection: synthesized missing report tx=0x%08x rx=0x%08x",
+					   proto_cfg.signature,
+					   peer_sigs[i]);
+			}
+		}
+	}
+
 	all_clear_done = true;
 	for (uint8_t i = 0; i < clear_peer_count && !proto_collect_per_cancel; i++) {
 		bool cleared;
@@ -3297,7 +3579,8 @@ static int proto_collect_per_run(const struct shell *shell, uint32_t expected,
 }
 
 static int proto_round_robin_run_internal(const struct shell *shell, uint32_t packets,
-					   uint32_t wait_ms, uint32_t retry_ms)
+				   uint32_t wait_ms, uint32_t retry_ms,
+				   uint32_t payload_len)
 {
 	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
 	uint32_t cycle_sigs[SHARED_TEST_LIST_MAX];
@@ -3330,6 +3613,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 		bool timed_out = false;
 		const char *ack_reason = "explicit";
 		bool req_acked = false;
+		uint8_t round_token = proto_next_remote_round_token();
 		uint32_t req_ack_wait_ms = wait_ms > REMOTE_TEST_REQ_ACK_WAIT_MIN_MS ?
 			wait_ms : REMOTE_TEST_REQ_ACK_WAIT_MIN_MS;
 
@@ -3346,6 +3630,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 		remote_test_monitor.done = false;
 		remote_test_monitor.delegate_signature = peer_sigs[i];
 		remote_test_monitor.expected_packets = (uint16_t)packets;
+		remote_test_monitor.round_token = round_token;
 		remote_test_monitor.reported_peers = 0u;
 		remote_test_monitor.reported_peer_count = 0u;
 		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
@@ -3371,12 +3656,15 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 			radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 			proto_cfg.role = RADIO_PROTO_ROLE_TX;
 
-			if (proto_send_frame_ex(shell,
-					    RADIO_PROTO_CMD_REMOTE_TEST_REQ,
-					    peer_sigs[i],
-					    (uint16_t)packets,
-					    proto_pack_u16_pair((uint16_t)wait_ms, (uint16_t)retry_ms),
-					    1u) != 0) {
+			if (proto_send_frame_raw_param_ex(shell,
+						      RADIO_PROTO_CMD_REMOTE_TEST_REQ,
+						      round_token,
+						      peer_sigs[i],
+						      (uint16_t)packets,
+						      proto_pack_u16_pair((uint16_t)wait_ms,
+									 (uint16_t)retry_ms),
+						      (uint8_t)payload_len,
+						      1u) != 0) {
 				node_apply_mode(RADIO_NODE_MODE_COORDINATOR);
 				continue;
 			}
@@ -3416,8 +3704,8 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 			}
 
 			/* Keep output matrix complete even if delegate never acknowledged request. */
-			for (uint8_t r = 0; r < peer_count; r++) {
-				uint32_t rx_sig = peer_sigs[r];
+			for (uint8_t r = 0; r < cycle_count; r++) {
+				uint32_t rx_sig = cycle_sigs[r];
 
 				if (rx_sig == peer_sigs[i]) {
 					continue;
@@ -3427,7 +3715,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 					continue;
 				}
 
-				proto_emit_per_timeout(rx_sig, peer_sigs[i], (uint16_t)packets);
+				proto_emit_per_unstarted(rx_sig, peer_sigs[i], (uint16_t)packets);
 				(void)remote_test_monitor_mark_peer_reported(rx_sig);
 				remote_test_monitor.reported_peers++;
 				synthesized_reports++;
@@ -3447,6 +3735,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 
 			remote_test_monitor.active = false;
 			remote_test_monitor.req_acked = false;
+			remote_test_monitor.round_token = 0u;
 			continue;
 		}
 
@@ -3475,8 +3764,8 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 			break;
 		}
 
-		for (uint8_t r = 0; r < peer_count; r++) {
-			uint32_t rx_sig = peer_sigs[r];
+		for (uint8_t r = 0; r < cycle_count; r++) {
+			uint32_t rx_sig = cycle_sigs[r];
 
 			if (rx_sig == peer_sigs[i]) {
 				continue;
@@ -3486,8 +3775,10 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 				continue;
 			}
 
-			/* Keep output matrix complete even when delegate misses a peer. */
-			proto_emit_per_timeout(rx_sig, peer_sigs[i], (uint16_t)packets);
+			/* Missing rows here are unknown to the coordinator because the delegate
+			 * never reported them back.
+			 */
+			proto_emit_per_unstarted(rx_sig, peer_sigs[i], (uint16_t)packets);
 			(void)remote_test_monitor_mark_peer_reported(rx_sig);
 			remote_test_monitor.reported_peers++;
 			synthesized_reports++;
@@ -3535,6 +3826,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 
 		remote_test_monitor.active = false;
 		remote_test_monitor.req_acked = false;
+		remote_test_monitor.round_token = 0u;
 		proto_clear_counters_before_test(shell, wait_ms, retry_ms);
 		radio_proto_reset_local_test_counter();
 
@@ -3547,14 +3839,17 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 	remote_test_monitor.active = false;
 	remote_test_monitor.req_acked = false;
 	remote_test_monitor.done = false;
+	remote_test_monitor.round_token = 0u;
 	proto_remote_test_cancel = false;
 	node_apply_mode(prev_mode);
 	return 0;
 }
 
 static bool remote_test_send_report_with_retry(uint32_t controller_signature,
+				       uint8_t round_token,
 					       uint32_t peer_signature,
 					       uint16_t reported_rx_packets,
+					       uint8_t report_status,
 					       uint16_t retry_ms)
 {
 	for (uint8_t attempt = 0; attempt < REMOTE_TEST_REPORT_RETRY_MAX; attempt++) {
@@ -3564,12 +3859,14 @@ static bool remote_test_send_report_with_retry(uint32_t controller_signature,
 		radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 		proto_cfg.role = RADIO_PROTO_ROLE_TX;
 
-		if (proto_send_frame_ex(NULL,
-				    RADIO_PROTO_CMD_REMOTE_TEST_REPORT,
-				    controller_signature,
-				    reported_rx_packets,
-				    peer_signature,
-				    1u) != 0) {
+		if (proto_send_frame_raw_param_ex(NULL,
+					       RADIO_PROTO_CMD_REMOTE_TEST_REPORT,
+					       round_token,
+					       controller_signature,
+					       reported_rx_packets,
+					       peer_signature,
+					       report_status,
+					       1u) != 0) {
 			continue;
 		}
 
@@ -3593,6 +3890,7 @@ static bool remote_test_send_report_with_retry(uint32_t controller_signature,
 }
 
 static bool remote_test_send_done_with_retry(uint32_t controller_signature,
+				     uint8_t round_token,
 				     uint16_t reported_peers,
 				     uint16_t retry_ms)
 {
@@ -3602,12 +3900,13 @@ static bool remote_test_send_done_with_retry(uint32_t controller_signature,
 		radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 		proto_cfg.role = RADIO_PROTO_ROLE_TX;
 
-		if (proto_send_frame_ex(NULL,
-				    RADIO_PROTO_CMD_REMOTE_TEST_DONE,
-				    controller_signature,
-				    reported_peers,
-				    0u,
-				    1u) != 0) {
+		if (proto_send_frame_raw_ex(NULL,
+					RADIO_PROTO_CMD_REMOTE_TEST_DONE,
+					round_token,
+					controller_signature,
+					reported_peers,
+					0u,
+					1u) != 0) {
 			continue;
 		}
 
@@ -3728,12 +4027,11 @@ static void remote_test_work_handler(struct k_work *work)
 	k_msleep(TEST_START_SETTLE_MS);
 
 	if (peer_count > 0u && request.packets > 0u) {
-		if (proto_send_frame_ex(NULL,
-				    RADIO_PROTO_CMD_TEST_DATA,
-				    RADIO_PROTO_BROADCAST_SIG,
-				    request.packets,
-				    0u,
-				    request.packets) == 0) {
+		if (proto_send_test_data_frame(NULL,
+					      RADIO_PROTO_BROADCAST_SIG,
+					      request.packets,
+					      request.test_payload_len,
+					      request.packets) == 0) {
 			k_msleep(request.wait_ms);
 		}
 
@@ -3795,12 +4093,29 @@ static void remote_test_work_handler(struct k_work *work)
 				       request.controller_signature,
 				       peer_sigs[i],
 				       request.packets);
+				if (remote_test_send_report_with_retry(request.controller_signature,
+						      request.round_token,
+						      peer_sigs[i],
+						      0u,
+						      REMOTE_TEST_REPORT_STATUS_PEER_TIMEOUT,
+						      request.retry_ms)) {
+					reported_peers++;
+					printk("RTW_DIAG,report,controller=0x%08x,peer=0x%08x,rx=-1,ok=1\n",
+					       request.controller_signature,
+					       peer_sigs[i]);
+				} else {
+					printk("RTW_DIAG,report,controller=0x%08x,peer=0x%08x,rx=-1,ok=0\n",
+					       request.controller_signature,
+					       peer_sigs[i]);
+				}
 				continue;
 			}
 
 			if (remote_test_send_report_with_retry(request.controller_signature,
+					      request.round_token,
 					      peer_sigs[i],
 					      reported_rx_packets,
+					      REMOTE_TEST_REPORT_STATUS_OK,
 					      request.retry_ms)) {
 				reported_peers++;
 				printk("RTW_DIAG,report,controller=0x%08x,peer=0x%08x,rx=%u,ok=1\n",
@@ -3822,6 +4137,7 @@ static void remote_test_work_handler(struct k_work *work)
 	}
 
 	if (!remote_test_send_done_with_retry(request.controller_signature,
+				      request.round_token,
 				      reported_peers,
 				      request.retry_ms)) {
 		if (proto_verbose_logging_enabled()) {
@@ -3839,6 +4155,8 @@ static void remote_test_work_handler(struct k_work *work)
 	radio_proto_reset();
 	radio_proto_reset_local_test_counter();
 	node_apply_mode(prev_mode);
+	remote_test_request.round_token = 0u;
+	remote_test_request.test_payload_len = 0u;
 	remote_test_request.busy = false;
 	proto_remote_test_cancel = false;
 }
@@ -3870,11 +4188,12 @@ static int cmd_proto_tx_run(const struct shell *shell, size_t argc, char **argv)
 	uint32_t packets = proto_cfg.test_packets;
 	uint32_t per_wait_ms = proto_cfg.per_wait_ms;
 	uint32_t retry_ms = proto_cfg.per_wait_ms;
+	uint32_t payload_len = proto_cfg.test_payload_len;
 	uint32_t peer_sigs[RADIO_PROTO_MAX_PEERS];
 	uint8_t peer_count;
 
-	if (argc > 4) {
-		shell_error(shell, "Usage: proto_tx_run [packets] [per_wait_ms] [retry_ms]");
+	if (argc > 5) {
+		shell_error(shell, "Usage: proto_tx_run [packets] [per_wait_ms] [retry_ms] [payload_len]");
 		return -EINVAL;
 	}
 
@@ -3888,8 +4207,11 @@ static int cmd_proto_tx_run(const struct shell *shell, size_t argc, char **argv)
 	if (argc >= 3) {
 		per_wait_ms = strtoul(argv[2], NULL, 0);
 	}
-	if (argc == 4) {
+	if (argc >= 4) {
 		retry_ms = strtoul(argv[3], NULL, 0);
+	}
+	if (argc == 5) {
+		payload_len = strtoul(argv[4], NULL, 0);
 	}
 
 	if (packets == 0 || packets > UINT16_MAX) {
@@ -3897,8 +4219,16 @@ static int cmd_proto_tx_run(const struct shell *shell, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
+	if (!proto_test_payload_len_valid(payload_len)) {
+		shell_error(shell, "payload_len must be in range %u..%u",
+			    (unsigned int)RADIO_PROTO_HEADER_SIZE,
+			    (unsigned int)IEEE_MAX_PAYLOAD_LEN);
+		return -EINVAL;
+	}
+
 	proto_cfg.test_packets = packets;
 	proto_cfg.per_wait_ms = per_wait_ms;
+	proto_cfg.test_payload_len = payload_len;
 
 	radio_proto_set_role(RADIO_PROTO_ROLE_TX);
 
@@ -3911,11 +4241,11 @@ static int cmd_proto_tx_run(const struct shell *shell, size_t argc, char **argv)
 	}
 
 	shell_print(shell, "TX run: sending %u TEST_DATA packets", packets);
-	if (proto_send_frame(shell,
-		    RADIO_PROTO_CMD_TEST_DATA,
-		    0xFFFFFFFFu,
-		    (uint16_t)packets,
-		    packets) != 0) {
+	if (proto_send_test_data_frame(shell,
+					 RADIO_PROTO_BROADCAST_SIG,
+					 (uint16_t)packets,
+					 payload_len,
+					 packets) != 0) {
 		return -EIO;
 	}
 
@@ -3933,9 +4263,10 @@ static int cmd_proto_round_robin_run(const struct shell *shell, size_t argc, cha
 	uint32_t packets = proto_cfg.test_packets;
 	uint32_t wait_ms = proto_cfg.per_wait_ms;
 	uint32_t retry_ms = proto_cfg.per_wait_ms;
+	uint32_t payload_len = proto_cfg.test_payload_len;
 
-	if (argc > 4) {
-		shell_error(shell, "Usage: proto_round_robin_run [packets] [wait_ms] [retry_ms]");
+	if (argc > 5) {
+		shell_error(shell, "Usage: proto_round_robin_run [packets] [wait_ms] [retry_ms] [payload_len]");
 		return -EINVAL;
 	}
 
@@ -3949,8 +4280,11 @@ static int cmd_proto_round_robin_run(const struct shell *shell, size_t argc, cha
 	if (argc >= 3) {
 		wait_ms = strtoul(argv[2], NULL, 0);
 	}
-	if (argc == 4) {
+	if (argc >= 4) {
 		retry_ms = strtoul(argv[3], NULL, 0);
+	}
+	if (argc == 5) {
+		payload_len = strtoul(argv[4], NULL, 0);
 	}
 
 	if (packets == 0 || packets > UINT16_MAX || wait_ms > UINT16_MAX || retry_ms > UINT16_MAX) {
@@ -3958,7 +4292,16 @@ static int cmd_proto_round_robin_run(const struct shell *shell, size_t argc, cha
 		return -EINVAL;
 	}
 
-	return proto_round_robin_run_internal(shell, packets, wait_ms, retry_ms);
+	if (!proto_test_payload_len_valid(payload_len)) {
+		shell_error(shell, "payload_len must be in range %u..%u",
+			    (unsigned int)RADIO_PROTO_HEADER_SIZE,
+			    (unsigned int)IEEE_MAX_PAYLOAD_LEN);
+		return -EINVAL;
+	}
+
+	proto_cfg.test_payload_len = payload_len;
+
+	return proto_round_robin_run_internal(shell, packets, wait_ms, retry_ms, payload_len);
 }
 
 static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **argv)
@@ -3966,14 +4309,15 @@ static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **arg
 	uint32_t packets = proto_cfg.test_packets;
 	uint32_t wait_ms = proto_cfg.per_wait_ms;
 	uint32_t retry_ms = proto_cfg.per_wait_ms;
+	uint32_t payload_len = proto_cfg.test_payload_len;
 	uint32_t cycle_sigs[SHARED_TEST_LIST_MAX];
 	uint8_t cycle_count;
 	int err;
 
 	proto_ack_start(shell, "proto_test_run");
 
-	if (argc > 4) {
-		shell_error(shell, "Usage: proto_test_run [packets] [wait_ms] [retry_ms]");
+	if (argc > 5) {
+		shell_error(shell, "Usage: proto_test_run [packets] [wait_ms] [retry_ms] [payload_len]");
 		err = -EINVAL;
 		goto out;
 	}
@@ -3989,8 +4333,11 @@ static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **arg
 	if (argc >= 3) {
 		wait_ms = strtoul(argv[2], NULL, 0);
 	}
-	if (argc == 4) {
+	if (argc >= 4) {
 		retry_ms = strtoul(argv[3], NULL, 0);
+	}
+	if (argc == 5) {
+		payload_len = strtoul(argv[4], NULL, 0);
 	}
 
 	if (packets == 0 || packets > UINT16_MAX || wait_ms > UINT16_MAX || retry_ms > UINT16_MAX) {
@@ -3999,9 +4346,18 @@ static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **arg
 		goto out;
 	}
 
+	if (!proto_test_payload_len_valid(payload_len)) {
+		shell_error(shell, "payload_len must be in range %u..%u",
+			    (unsigned int)RADIO_PROTO_HEADER_SIZE,
+			    (unsigned int)IEEE_MAX_PAYLOAD_LEN);
+		err = -EINVAL;
+		goto out;
+	}
+
 	/* Keep existing local TX behavior, then run delegated round-robin in one command. */
 	proto_cfg.test_packets = packets;
 	proto_cfg.per_wait_ms = wait_ms;
+	proto_cfg.test_payload_len = payload_len;
 	cycle_count = proto_build_cycle_node_list(cycle_sigs, ARRAY_SIZE(cycle_sigs));
 	if (cycle_count == 0u) {
 		err = 0;
@@ -4030,11 +4386,11 @@ static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **arg
 				      retry_ms);
 	k_msleep(TEST_START_SETTLE_MS);
 
-	if (proto_send_frame(shell,
-		    RADIO_PROTO_CMD_TEST_DATA,
-		    0xFFFFFFFFu,
-		    (uint16_t)packets,
-		    packets) != 0) {
+	if (proto_send_test_data_frame(shell,
+					 RADIO_PROTO_BROADCAST_SIG,
+					 (uint16_t)packets,
+					 payload_len,
+					 packets) != 0) {
 		err = -EIO;
 		goto out;
 	}
@@ -4049,7 +4405,7 @@ static int cmd_proto_test_run(const struct shell *shell, size_t argc, char **arg
 				      retry_ms);
 	(void)proto_collect_per_run(shell, packets, wait_ms, retry_ms);
 	radio_proto_reset_local_test_counter();
-	err = proto_round_robin_run_internal(shell, packets, wait_ms, retry_ms);
+	err = proto_round_robin_run_internal(shell, packets, wait_ms, retry_ms, payload_len);
 
 out:
 	proto_ack_end(shell, "proto_test_run", err);
