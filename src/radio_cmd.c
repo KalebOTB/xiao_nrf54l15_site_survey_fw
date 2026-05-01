@@ -176,7 +176,7 @@ static uint32_t rssi_monitor_interval_ms = 250u;
 static void rssi_monitor_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(rssi_monitor_work, rssi_monitor_work_handler);
 
-#define KALEB_TEST_KNOB 30u
+#define KALEB_TEST_KNOB 60u
 #define NODE_RELEASE_APPLY_DELAY_MS 200
 #define NODE_SETTINGS_SAVE_DELAY_MS 300
 #define RSSI_MONITOR_INTERVAL_MIN_MS 1u
@@ -218,6 +218,7 @@ struct remote_test_monitor_state {
 	volatile bool active;
 	volatile bool req_acked;
 	volatile bool done;
+	volatile bool start_seen;
 	volatile uint32_t delegate_signature;
 	volatile uint16_t expected_packets;
 	volatile uint8_t round_token;
@@ -243,6 +244,12 @@ static volatile uint32_t control_ack_sender;
 static volatile uint16_t control_ack_cmd;
 static volatile uint32_t control_ack_context;
 static uint8_t remote_test_round_token_counter;
+
+
+bool radio_proto_remote_test_busy(void)
+{
+	return remote_test_request.busy || remote_test_request.pending;
+}
 
 
 void radio_node_note_proto_frame_activity(uint32_t src_signature)
@@ -525,6 +532,38 @@ static void proto_emit_per_unstarted(uint32_t rx_signature, uint32_t tx_signatur
 	       (unsigned int)config.channel_start);
 
 	/* Preserve the timeout-shaped companion row for missing delegated starts. */
+	printk("PER_REPORT_TIMEOUT,0x%08x,0x%08x,%u,%u,%u\n",
+	       tx_signature,
+	       rx_signature,
+	       (unsigned int)sent_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
+
+#if HALT_ON_PER_REPORT_NEG2
+	printk("DEBUG_HALT,reason=per_report_neg2,tx=0x%08x,rx=0x%08x,sent=%u,payload_len=%u,channel=%u\n",
+	       tx_signature,
+	       rx_signature,
+	       (unsigned int)sent_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
+
+	for (;;) {
+		k_busy_wait(1000000);
+	}
+#endif
+}
+
+static void proto_emit_per_link_fail(uint32_t tx_signature, uint32_t rx_signature,
+				    uint16_t sent_packets)
+{
+	/* -3 denotes failure on the coordinator-to-delegate control/reporting link. */
+	printk("PER_REPORT,0x%08x,0x%08x,%u,-3,%u,%u\n",
+	       tx_signature,
+	       rx_signature,
+	       (unsigned int)sent_packets,
+	       (unsigned int)proto_cfg.test_payload_len,
+	       (unsigned int)config.channel_start);
+
 	printk("PER_REPORT_TIMEOUT,0x%08x,0x%08x,%u,%u,%u\n",
 	       tx_signature,
 	       rx_signature,
@@ -2554,6 +2593,20 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 		       proto_cfg.signature,
 		       node_mode_str((enum radio_node_mode)node_cfg.mode),
 		       (unsigned int)proto_cfg.role);
+		if (remote_test_monitor.active &&
+		    frame->src_signature == remote_test_monitor.delegate_signature) {
+			remote_test_monitor.start_seen = true;
+			remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
+			if (!remote_test_monitor.req_acked) {
+				remote_test_monitor.req_acked = true;
+				remote_test_req_ack_received = true;
+				remote_test_req_ack_packets = remote_test_monitor.expected_packets;
+				printk("RR_DIAG,ack_promote,delegate=0x%08x,token=%u,reason=boundary_start,packets=%u\n",
+				       frame->src_signature,
+				       (unsigned int)remote_test_monitor.round_token,
+				       (unsigned int)remote_test_monitor.expected_packets);
+			}
+		}
 		radio_proto_begin_test_session(frame->src_signature);
 		radio_proto_schedule_response_ext(RADIO_PROTO_CMD_CONTROL_ACK,
 					 frame->src_signature,
@@ -2659,9 +2712,29 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	    node_cfg.mode != RADIO_NODE_MODE_COORDINATOR &&
 	    node_cfg.mode != RADIO_NODE_MODE_TEST_TX &&
 	    frame->dst_signature == proto_cfg.signature) {
+		enum radio_proto_role local_role = radio_proto_get_role();
+
+		if (local_role != RADIO_PROTO_ROLE_RX) {
+			if (proto_verbose_logging_enabled()) {
+				printk("Ignored REMOTE_TEST_REQ from 0x%08x: role=%u mode=%s token=%u\n",
+				       frame->src_signature,
+				       (unsigned int)local_role,
+				       node_mode_str((enum radio_node_mode)node_cfg.mode),
+				       (unsigned int)frame->flags);
+			}
+			return;
+		}
+
 		if (remote_test_request.busy || remote_test_request.pending) {
 			if (frame->src_signature == remote_test_request.controller_signature &&
 			    frame->flags == remote_test_request.round_token) {
+				printk("RTW_DIAG,req_ack_sched,controller=0x%08x,token=%u,packets=%u,busy=%u,pending=%u,role=%u,reason=duplicate\n",
+				       frame->src_signature,
+				       (unsigned int)frame->flags,
+				       (unsigned int)frame->value,
+				       remote_test_request.busy ? 1u : 0u,
+				       remote_test_request.pending ? 1u : 0u,
+				       (unsigned int)local_role);
 				radio_proto_schedule_response_raw(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
 							 frame->flags,
 							 frame->src_signature,
@@ -2696,6 +2769,13 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 			remote_test_request.test_payload_len = (uint8_t)proto_cfg.test_payload_len;
 		}
 		remote_test_request.pending = true;
+		printk("RTW_DIAG,req_ack_sched,controller=0x%08x,token=%u,packets=%u,busy=%u,pending=%u,role=%u,reason=accept\n",
+		       frame->src_signature,
+		       (unsigned int)frame->flags,
+		       (unsigned int)frame->value,
+		       remote_test_request.busy ? 1u : 0u,
+		       remote_test_request.pending ? 1u : 0u,
+		       (unsigned int)local_role);
 		radio_proto_schedule_response_raw(RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK,
 						 frame->flags,
 						 frame->src_signature,
@@ -2711,21 +2791,51 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	}
 
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK &&
-	    frame->dst_signature == proto_cfg.signature &&
-	    remote_test_monitor.active &&
-	    frame->flags == remote_test_monitor.round_token &&
-	    frame->src_signature == remote_test_monitor.delegate_signature) {
-		remote_test_req_ack_packets = frame->value;
-		remote_test_req_ack_received = true;
+	    frame->dst_signature == proto_cfg.signature) {
+		printk("RR_DIAG,ack_seen,delegate=0x%08x,token=%u,packets=%u,active=%u,expect_delegate=0x%08x,expect_token=%u\n",
+		       frame->src_signature,
+		       (unsigned int)frame->flags,
+		       (unsigned int)frame->value,
+		       remote_test_monitor.active ? 1u : 0u,
+		       remote_test_monitor.delegate_signature,
+		       (unsigned int)remote_test_monitor.round_token);
+
+		if (remote_test_monitor.active &&
+		    frame->flags == remote_test_monitor.round_token &&
+		    frame->src_signature == remote_test_monitor.delegate_signature) {
+			printk("RR_DIAG,ack_rx,delegate=0x%08x,token=%u,packets=%u\n",
+			       frame->src_signature,
+			       (unsigned int)frame->flags,
+			       (unsigned int)frame->value);
+			remote_test_req_ack_packets = frame->value;
+			remote_test_req_ack_received = true;
+		} else {
+			printk("RR_DIAG,ack_ignored,delegate=0x%08x,token=%u,packets=%u,active=%u,expect_delegate=0x%08x,expect_token=%u\n",
+			       frame->src_signature,
+			       (unsigned int)frame->flags,
+			       (unsigned int)frame->value,
+			       remote_test_monitor.active ? 1u : 0u,
+			       remote_test_monitor.delegate_signature,
+			       (unsigned int)remote_test_monitor.round_token);
+		}
 		return;
 	}
 
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REPORT &&
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_monitor.active &&
-	    remote_test_monitor.req_acked &&
 	    frame->flags == remote_test_monitor.round_token &&
 	    frame->src_signature == remote_test_monitor.delegate_signature) {
+		if (!remote_test_monitor.req_acked) {
+			remote_test_monitor.req_acked = true;
+			remote_test_req_ack_received = true;
+			remote_test_req_ack_packets = remote_test_monitor.expected_packets;
+			printk("RR_DIAG,ack_promote,delegate=0x%08x,token=%u,reason=report,packets=%u\n",
+			       frame->src_signature,
+			       (unsigned int)frame->flags,
+			       (unsigned int)remote_test_monitor.expected_packets);
+		}
+
 		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
 		if (remote_test_monitor_mark_peer_reported(frame->aux_signature)) {
 			remote_test_monitor.reported_peers++;
@@ -2752,10 +2862,19 @@ void radio_node_handle_proto_frame(const struct radio_proto_frame *frame)
 	if (frame->cmd == RADIO_PROTO_CMD_REMOTE_TEST_DONE &&
 	    frame->dst_signature == proto_cfg.signature &&
 	    remote_test_monitor.active &&
-	    remote_test_monitor.req_acked &&
 	    frame->flags == remote_test_monitor.round_token &&
 	    frame->src_signature == remote_test_monitor.delegate_signature) {
 		bool first_done = !remote_test_monitor.done;
+
+		if (!remote_test_monitor.req_acked) {
+			remote_test_monitor.req_acked = true;
+			remote_test_req_ack_received = true;
+			remote_test_req_ack_packets = remote_test_monitor.expected_packets;
+			printk("RR_DIAG,ack_promote,delegate=0x%08x,token=%u,reason=done,packets=%u\n",
+			       frame->src_signature,
+			       (unsigned int)frame->flags,
+			       (unsigned int)remote_test_monitor.expected_packets);
+		}
 
 		remote_test_monitor.last_activity_ticks = (uint32_t)k_uptime_get_32();
 		remote_test_monitor.reported_peers = remote_test_monitor.reported_peer_count;
@@ -3628,6 +3747,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 		remote_test_monitor.active = true;
 		remote_test_monitor.req_acked = false;
 		remote_test_monitor.done = false;
+		remote_test_monitor.start_seen = false;
 		remote_test_monitor.delegate_signature = peer_sigs[i];
 		remote_test_monitor.expected_packets = (uint16_t)packets;
 		remote_test_monitor.round_token = round_token;
@@ -3715,7 +3835,13 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 					continue;
 				}
 
-				proto_emit_per_unstarted(rx_sig, peer_sigs[i], (uint16_t)packets);
+				if (rx_sig == proto_cfg.signature) {
+					proto_emit_per_link_fail(proto_cfg.signature,
+								 peer_sigs[i],
+								 (uint16_t)packets);
+				} else {
+					proto_emit_per_unstarted(rx_sig, peer_sigs[i], (uint16_t)packets);
+				}
 				(void)remote_test_monitor_mark_peer_reported(rx_sig);
 				remote_test_monitor.reported_peers++;
 				synthesized_reports++;
@@ -3735,6 +3861,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 
 			remote_test_monitor.active = false;
 			remote_test_monitor.req_acked = false;
+			remote_test_monitor.start_seen = false;
 			remote_test_monitor.round_token = 0u;
 			continue;
 		}
@@ -3778,7 +3905,13 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 			/* Missing rows here are unknown to the coordinator because the delegate
 			 * never reported them back.
 			 */
-			proto_emit_per_unstarted(rx_sig, peer_sigs[i], (uint16_t)packets);
+			if (rx_sig == proto_cfg.signature) {
+				proto_emit_per_link_fail(proto_cfg.signature,
+							 peer_sigs[i],
+							 (uint16_t)packets);
+			} else {
+				proto_emit_per_unstarted(rx_sig, peer_sigs[i], (uint16_t)packets);
+			}
 			(void)remote_test_monitor_mark_peer_reported(rx_sig);
 			remote_test_monitor.reported_peers++;
 			synthesized_reports++;
@@ -3826,6 +3959,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 
 		remote_test_monitor.active = false;
 		remote_test_monitor.req_acked = false;
+		remote_test_monitor.start_seen = false;
 		remote_test_monitor.round_token = 0u;
 		proto_clear_counters_before_test(shell, wait_ms, retry_ms);
 		radio_proto_reset_local_test_counter();
@@ -3839,6 +3973,7 @@ static int proto_round_robin_run_internal(const struct shell *shell, uint32_t pa
 	remote_test_monitor.active = false;
 	remote_test_monitor.req_acked = false;
 	remote_test_monitor.done = false;
+	remote_test_monitor.start_seen = false;
 	remote_test_monitor.round_token = 0u;
 	proto_remote_test_cancel = false;
 	node_apply_mode(prev_mode);

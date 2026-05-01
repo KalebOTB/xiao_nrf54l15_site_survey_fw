@@ -170,7 +170,8 @@ PER_REPORT,<tx_serial>,<rx_serial>,<total_sent>,<total_received>,<payload_len>,<
 
 Meaning of special `total_received` values:
 - `-1`: the test ran, but that receiver never produced a usable PER response
-- `-2`: the delegated round result is unknown because the delegate failed to communicate the round back to the coordinator
+- `-2`: the delegated round result is unknown for non-coordinator receivers because the delegate failed to communicate the round back to the coordinator
+- `-3`: the coordinator-to-delegate reporting link failed, so the coordinator never got a usable round result back from that delegate
 
 In addition, the firmware emits:
 
@@ -371,7 +372,8 @@ These diagnostics are useful for debugging but should not be treated as the stab
 
 Check whether the missing row should be:
 - `-1`: receiver-specific PER response was missing after a real test attempt
-- `-2`: delegate round result is unknown because the delegate never properly communicated the round back to the coordinator
+- `-2`: delegated round result is unknown for a non-coordinator receiver because the delegate never properly communicated the round back to the coordinator
+- `-3`: delegated round result is missing specifically on the coordinator-to-delegate reporting link
 
 Verbose logs to inspect:
 - `CTRL_DIAG,...` for control-plane ACK failures

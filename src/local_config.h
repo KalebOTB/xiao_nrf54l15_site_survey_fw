@@ -1,2 +1,3 @@
 #define VERBOSE_LOGGING 0 //Set 1 to output verbose logging, 0 to disable. Verbose logging includes additional information about received frames and other events, which can be helpful for debugging and analysis.
 #define VERBOSE_LOGGING_ALL 0 //Set 1 to output all verbose logging, including very detailed information about received frames, which can be useful for in-depth debugging. Set to 0 to disable this level of logging.
+#define HALT_ON_PER_REPORT_NEG2 1 //Set 1 to freeze the device immediately after emitting a -2 PER_REPORT. Set to 0 for normal runtime behavior.

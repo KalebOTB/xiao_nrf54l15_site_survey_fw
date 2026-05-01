@@ -338,6 +338,8 @@ void radio_proto_set_role(enum radio_proto_role role);
 
 enum radio_proto_role radio_proto_get_role(void);
 
+bool radio_proto_remote_test_busy(void);
+
 enum radio_survey_node_type radio_proto_get_local_node_type(void);
 
 bool radio_proto_get_local_aggregator(void);
