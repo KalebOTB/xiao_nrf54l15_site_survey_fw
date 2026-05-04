@@ -86,6 +86,7 @@
 /* RX timeout counted from the last packet received. */
 #define RX_PACKET_TIMEOUT_MS 100
 #define PROTO_RSP_RETRY_DELAY_MS 10u
+#define PROTO_RSP_QUEUE_LEN 8u
 
 /* Buffer for the radio TX packet */
 static uint8_t tx_packet[RADIO_MAX_PAYLOAD_LEN];
@@ -190,12 +191,27 @@ static uint32_t proto_per_rsp_seen;
 static uint32_t proto_local_test_data_rx;
 static bool proto_test_session_active;
 static uint32_t proto_test_session_broadcaster;
+static bool proto_test_result_valid;
+static uint32_t proto_test_result_broadcaster;
 static struct radio_proto_peer proto_peers[RADIO_PROTO_MAX_PEERS];
 static uint8_t proto_peer_count;
 
 static bool proto_tx_override_valid;
 static uint8_t proto_tx_override_payload[IEEE_MAX_PAYLOAD_LEN];
 static uint8_t proto_tx_override_len;
+
+struct proto_pending_response {
+	enum radio_proto_cmd cmd;
+	uint32_t dst_sig;
+	uint16_t value;
+	uint32_t aux_sig;
+	bool use_raw_flags;
+	uint8_t flags;
+};
+
+static struct proto_pending_response proto_rsp_queue[PROTO_RSP_QUEUE_LEN];
+static uint8_t proto_rsp_queue_head;
+static uint8_t proto_rsp_queue_count;
 
 static bool proto_rsp_pending;
 static enum radio_proto_cmd proto_rsp_cmd;
@@ -209,6 +225,93 @@ static bool proto_resume_rx_after_rsp;
 static uint8_t proto_rx_channel;
 static enum transmit_pattern proto_rx_pattern;
 static int8_t proto_response_txpower_dbm;
+
+static bool proto_rsp_queue_entry_equals(const struct proto_pending_response *entry,
+					      enum radio_proto_cmd cmd,
+					      uint32_t dst_signature,
+					      uint16_t value,
+					      uint32_t aux_signature,
+					      bool use_raw_flags,
+					      uint8_t flags)
+{
+	return entry->cmd == cmd &&
+	       entry->dst_sig == dst_signature &&
+	       entry->value == value &&
+	       entry->aux_sig == aux_signature &&
+	       entry->use_raw_flags == use_raw_flags &&
+	       entry->flags == flags;
+}
+
+static bool proto_rsp_queue_contains(enum radio_proto_cmd cmd,
+				     uint32_t dst_signature,
+				     uint16_t value,
+				     uint32_t aux_signature,
+				     bool use_raw_flags,
+				     uint8_t flags)
+{
+	for (uint8_t i = 0; i < proto_rsp_queue_count; i++) {
+		uint8_t index = (uint8_t)((proto_rsp_queue_head + i) % PROTO_RSP_QUEUE_LEN);
+		const struct proto_pending_response *entry = &proto_rsp_queue[index];
+
+		if (proto_rsp_queue_entry_equals(entry,
+					       cmd,
+					       dst_signature,
+					       value,
+					       aux_signature,
+					       use_raw_flags,
+					       flags)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool proto_rsp_queue_push(enum radio_proto_cmd cmd,
+				 uint32_t dst_signature,
+				 uint16_t value,
+				 uint32_t aux_signature,
+				 bool use_raw_flags,
+				 uint8_t flags)
+{
+	uint8_t tail;
+	struct proto_pending_response *entry;
+
+	if (proto_resume_rx_after_rsp &&
+	    proto_rsp_cmd == cmd &&
+	    proto_rsp_dst_sig == dst_signature &&
+	    proto_rsp_value == value &&
+	    proto_rsp_aux_sig == aux_signature &&
+	    proto_rsp_use_raw_flags == use_raw_flags &&
+	    proto_rsp_flags == flags) {
+		return true;
+	}
+
+	if (proto_rsp_queue_contains(cmd,
+				     dst_signature,
+				     value,
+				     aux_signature,
+				     use_raw_flags,
+				     flags)) {
+		return true;
+	}
+
+	if (proto_rsp_queue_count >= PROTO_RSP_QUEUE_LEN) {
+		return false;
+	}
+
+	tail = (uint8_t)((proto_rsp_queue_head + proto_rsp_queue_count) % PROTO_RSP_QUEUE_LEN);
+	entry = &proto_rsp_queue[tail];
+	entry->cmd = cmd;
+	entry->dst_sig = dst_signature;
+	entry->value = value;
+	entry->aux_sig = aux_signature;
+	entry->use_raw_flags = use_raw_flags;
+	entry->flags = flags;
+	proto_rsp_queue_count++;
+	proto_rsp_pending = true;
+	return true;
+}
 
 static void proto_rsp_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(proto_rsp_work, proto_rsp_work_handler);
@@ -838,12 +941,15 @@ void radio_proto_schedule_response_ext(enum radio_proto_cmd cmd, uint32_t dst_si
 		return;
 	}
 
-	proto_rsp_cmd = cmd;
-	proto_rsp_dst_sig = dst_signature;
-	proto_rsp_value = value;
-	proto_rsp_aux_sig = aux_signature;
-	proto_rsp_use_raw_flags = false;
-	proto_rsp_pending = true;
+	if (!proto_rsp_queue_push(cmd, dst_signature, value, aux_signature, false, 0u)) {
+		printk("RSP_DIAG,drop,cmd=%u,dst=0x%08X,value=%u,aux=0x%08X,raw=0,queue=%u\n",
+		       (unsigned int)cmd,
+		       dst_signature,
+		       (unsigned int)value,
+		       aux_signature,
+		       (unsigned int)proto_rsp_queue_count);
+		return;
+	}
 
 	/* Spread responder transmissions and leave time for TX node to switch to RX. */
 	k_work_reschedule(&proto_rsp_work, K_MSEC((sys_rand32_get() % 25u) + 15u));
@@ -867,13 +973,15 @@ void radio_proto_schedule_response_raw(enum radio_proto_cmd cmd,
 		return;
 	}
 
-	proto_rsp_cmd = cmd;
-	proto_rsp_dst_sig = dst_signature;
-	proto_rsp_value = value;
-	proto_rsp_aux_sig = aux_signature;
-	proto_rsp_flags = flags;
-	proto_rsp_use_raw_flags = true;
-	proto_rsp_pending = true;
+	if (!proto_rsp_queue_push(cmd, dst_signature, value, aux_signature, true, flags)) {
+		printk("RSP_DIAG,drop,cmd=%u,dst=0x%08X,flags=%u,value=%u,raw=1,queue=%u\n",
+		       (unsigned int)cmd,
+		       dst_signature,
+		       (unsigned int)flags,
+		       (unsigned int)value,
+		       (unsigned int)proto_rsp_queue_count);
+		return;
+	}
 
 	/* Spread responder transmissions and leave time for TX node to switch to RX. */
 	k_work_reschedule(&proto_rsp_work, K_MSEC((sys_rand32_get() % 25u) + 15u));
@@ -1715,7 +1823,12 @@ void radio_handler(const void *context)
 					proto_per_req_seen++;
 					if (proto_role == RADIO_PROTO_ROLE_RX &&
 					    proto_frame_for_me(frame.dst_signature) &&
-					    !radio_proto_remote_test_busy()) {
+					    !radio_proto_remote_test_busy() &&
+					    ((proto_test_session_active &&
+					      proto_test_session_broadcaster == frame.src_signature) ||
+					     (!proto_test_session_active &&
+					      proto_test_result_valid &&
+					      proto_test_result_broadcaster == frame.src_signature))) {
 						printk("PER_DIAG,rsp_sched,from=0x%08X,dst=0x%08X,local=0x%08X,role=%u,active=%u,broadcaster=0x%08X,rx=%u\n",
 						       frame.src_signature,
 						       frame.dst_signature,
@@ -1729,7 +1842,7 @@ void radio_handler(const void *context)
 								      (uint16_t)MIN(proto_local_test_data_rx,
 										  UINT16_MAX));
 					} else if (proto_frame_for_me(frame.dst_signature)) {
-						printk("PER_DIAG,ignored,from=0x%08X,dst=0x%08X,local=0x%08X,role=%u,active=%u,broadcaster=0x%08X,rx=%u,remote_busy=%u\n",
+						printk("PER_DIAG,ignored,from=0x%08X,dst=0x%08X,local=0x%08X,role=%u,active=%u,broadcaster=0x%08X,rx=%u,remote_busy=%u,result_valid=%u,result_broadcaster=0x%08X\n",
 						       frame.src_signature,
 						       frame.dst_signature,
 						       proto_local_signature,
@@ -1737,7 +1850,9 @@ void radio_handler(const void *context)
 						       proto_test_session_active ? 1u : 0u,
 						       proto_test_session_broadcaster,
 						       (unsigned int)proto_local_test_data_rx,
-						       radio_proto_remote_test_busy() ? 1u : 0u);
+						       radio_proto_remote_test_busy() ? 1u : 0u,
+						       proto_test_result_valid ? 1u : 0u,
+						       proto_test_result_broadcaster);
 					}
 					break;
 				case RADIO_PROTO_CMD_PER_RSP:
@@ -1769,6 +1884,8 @@ void radio_handler(const void *context)
 						       (unsigned int)proto_local_test_data_rx);
 						proto_test_session_active = false;
 						proto_test_session_broadcaster = 0u;
+						proto_test_result_valid = false;
+						proto_test_result_broadcaster = 0u;
 						proto_local_test_data_rx = 0;
 						radio_proto_schedule_response_ext(RADIO_PROTO_CMD_CONTROL_ACK,
 										  frame.src_signature,
@@ -1891,6 +2008,9 @@ void radio_handler(const void *context)
 				 proto_rx_channel,
 				 proto_rx_pattern,
 				 0);
+			if (proto_rsp_queue_count != 0u) {
+				k_work_reschedule(&proto_rsp_work, K_NO_WAIT);
+			}
 		} else if (config->type == MODULATED_TX ||
 			   config->type == MODULATED_TX_DUTY_CYCLE) {
 			on_radio_end(config);
@@ -1911,19 +2031,23 @@ void radio_handler(const void *context)
 
 static void proto_rsp_work_handler(struct k_work *work)
 {
+	struct proto_pending_response *entry;
+
 	ARG_UNUSED(work);
 
-	if (!proto_rsp_pending) {
+	if (!proto_rsp_pending || proto_rsp_queue_count == 0u) {
 		return;
 	}
 
+	entry = &proto_rsp_queue[proto_rsp_queue_head];
+
 	if (proto_role != RADIO_PROTO_ROLE_RX) {
-		if (proto_rsp_cmd == RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK) {
+		if (entry->cmd == RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK) {
 			printk("RSP_DIAG,defer,cmd=%u,dst=0x%08X,flags=%u,value=%u,role=%u\n",
-			       (unsigned int)proto_rsp_cmd,
-			       proto_rsp_dst_sig,
-			       (unsigned int)proto_rsp_flags,
-			       (unsigned int)proto_rsp_value,
+			       (unsigned int)entry->cmd,
+			       entry->dst_sig,
+			       (unsigned int)entry->flags,
+			       (unsigned int)entry->value,
 			       (unsigned int)proto_role);
 		}
 
@@ -1931,25 +2055,32 @@ static void proto_rsp_work_handler(struct k_work *work)
 		return;
 	}
 
-	if (proto_rsp_use_raw_flags) {
-		if (radio_proto_prepare_tx_raw(proto_rsp_cmd,
-					       proto_rsp_flags,
+	if (entry->use_raw_flags) {
+		if (radio_proto_prepare_tx_raw(entry->cmd,
+					       entry->flags,
 					       proto_local_signature,
-					       proto_rsp_dst_sig,
-					       proto_rsp_value,
-					       proto_rsp_aux_sig) != 0) {
+					       entry->dst_sig,
+					       entry->value,
+					       entry->aux_sig) != 0) {
 			return;
 		}
-	} else if (radio_proto_prepare_tx_ext(proto_rsp_cmd,
-					  proto_rsp_dst_sig,
-					  proto_rsp_value,
-					  proto_rsp_cmd == RADIO_PROTO_CMD_DISCOVER_RSP ?
-					  proto_local_profile_pack() : proto_rsp_aux_sig) != 0) {
+	} else if (radio_proto_prepare_tx_ext(entry->cmd,
+					  entry->dst_sig,
+					  entry->value,
+					  entry->cmd == RADIO_PROTO_CMD_DISCOVER_RSP ?
+					  proto_local_profile_pack() : entry->aux_sig) != 0) {
 		return;
 	}
 
-	proto_rsp_pending = false;
-	proto_rsp_use_raw_flags = false;
+	proto_rsp_cmd = entry->cmd;
+	proto_rsp_dst_sig = entry->dst_sig;
+	proto_rsp_value = entry->value;
+	proto_rsp_aux_sig = entry->aux_sig;
+	proto_rsp_use_raw_flags = entry->use_raw_flags;
+	proto_rsp_flags = entry->flags;
+	proto_rsp_queue_head = (uint8_t)((proto_rsp_queue_head + 1u) % PROTO_RSP_QUEUE_LEN);
+	proto_rsp_queue_count--;
+	proto_rsp_pending = (proto_rsp_queue_count != 0u);
 	proto_resume_rx_after_rsp = true;
 
 	if (proto_rsp_cmd == RADIO_PROTO_CMD_REMOTE_TEST_REQ_ACK) {
@@ -2015,6 +2146,8 @@ void radio_proto_begin_test_session(uint32_t broadcaster_signature)
 {
 	proto_test_session_broadcaster = broadcaster_signature;
 	proto_test_session_active = true;
+	proto_test_result_valid = false;
+	proto_test_result_broadcaster = broadcaster_signature;
 	proto_local_test_data_rx = 0u;
 }
 
@@ -2026,6 +2159,12 @@ void radio_proto_end_test_session(uint32_t broadcaster_signature)
 		return;
 	}
 
+	if (proto_test_session_broadcaster == 0u) {
+		return;
+	}
+
+	proto_test_result_valid = (proto_test_session_broadcaster != 0u);
+	proto_test_result_broadcaster = proto_test_session_broadcaster;
 	proto_test_session_active = false;
 	proto_test_session_broadcaster = 0u;
 }
@@ -2035,6 +2174,8 @@ void radio_proto_reset_local_test_counter(void)
 	proto_local_test_data_rx = 0u;
 	proto_test_session_active = false;
 	proto_test_session_broadcaster = 0u;
+	proto_test_result_valid = false;
+	proto_test_result_broadcaster = 0u;
 }
 
 void radio_proto_reset(void)
@@ -2047,7 +2188,11 @@ void radio_proto_reset(void)
 	proto_local_test_data_rx = 0;
 	proto_test_session_active = false;
 	proto_test_session_broadcaster = 0u;
+	proto_test_result_valid = false;
+	proto_test_result_broadcaster = 0u;
 	proto_peer_count = 0;
+	proto_rsp_queue_head = 0u;
+	proto_rsp_queue_count = 0u;
 	proto_rsp_pending = false;
 	proto_rsp_use_raw_flags = false;
 	proto_resume_rx_after_rsp = false;

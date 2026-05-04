@@ -117,7 +117,7 @@ The active broadcaster:
 
 A receiver:
 - counts `TEST_DATA` only while the test session is active for the current broadcaster
-- returns its counted packet total in `PER_RSP`
+- returns its counted packet total in `PER_RSP` only for that same broadcaster, either while the matching test window is still active or after it has completed
 
 ### Test Modes
 
@@ -241,7 +241,7 @@ log_mode verbose
 
 Meaning:
 - `minimal`: intended for host-side parsers, keeps output mostly to ACK and PER lines
-- `verbose`: enables coordination diagnostics such as `CTRL_DIAG`, `RR_DIAG`, `RTW_DIAG`, `BOUNDARY_DIAG`, and `PER_DIAG`
+- `verbose`: enables coordination diagnostics such as `CTRL_DIAG`, `RR_DIAG`, `RTW_DIAG`, `BOUNDARY_DIAG`, `PER_DIAG`, and `RSP_DIAG`
 
 Compile-time debug toggles live in `src/local_config.h`.
 
@@ -363,6 +363,7 @@ Verbose mode can also emit diagnostics such as:
 - `RTW_DIAG,...`
 - `BOUNDARY_DIAG,...`
 - `PER_DIAG,...`
+- `RSP_DIAG,...`
 
 These diagnostics are useful for debugging but should not be treated as the stable host-parser contract.
 
@@ -380,6 +381,10 @@ Verbose logs to inspect:
 - `RR_DIAG,req,...` for delegate-start failures
 - `RTW_DIAG,per_rsp_timeout,...` for delegate-side receiver misses
 - `RTW_DIAG,report,...` for delegate-to-coordinator report delivery issues
+- `PER_DIAG,ignored,...,remote_busy=1` when a receiver intentionally ignores `PER_REQ` because it is already busy with its own delegated round
+- `RSP_DIAG,drop,...` when the responder side has to drop a queued reply because the response queue is full
+
+If one peer pair repeatedly shows `-1` in both directions while both nodes still report normal values to a third node, treat that as a selective pair failure rather than a whole-network outage. In that case inspect the surrounding `PER_DIAG,...`, `RTW_DIAG,...`, and `RSP_DIAG,...` lines before assuming RF loss.
 
 ### Weak links after moving a node
 
@@ -409,3 +414,5 @@ Example:
 - Persisted node metadata is stored through Zephyr settings/NVS.
 - `TEST_DATA` remains broadcaster-to-receiver traffic with no relay forwarding.
 - Receivers count packets only inside the explicit `TEST_START` / `TEST_END` window for the active broadcaster.
+- Receivers ignore `PER_REQ` while they are already busy servicing their own delegated remote-test round, to avoid replying with stale local counts.
+- Receivers also ignore `PER_REQ` when they do not have a matching active or completed result for that requesting broadcaster, instead of replying with a misleading zero.
